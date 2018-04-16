@@ -11,10 +11,6 @@
 #define WHITE 0
 #define BLACK 1
 
-int positions_evaluated = 0;
-char str_pfx[100];
-int str_index = 0;
-
 typedef struct Coord {
 	int row;
 	int col;
@@ -40,24 +36,34 @@ typedef struct Evaluated_Move {
 	int evaluation;
 } Evaluated_Move;
 
-int find_max_index(int array[], int length) { // Length must be greater than zero
+void print_move(Move *move);
+int judge_position(Position *pp, Evaluated_Move *mp, int depth);
+int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth);
+int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth);
+void make_move(Position *pp_old, Position *pp_new, Move *move);
+
+int positions_evaluated = 0;
+char str_pfx[100];
+int str_index = 0;
+
+int find_max_index(Evaluated_Move array[], int length) { // Length must be greater than zero
 	int max_index = 0;
-	int max = array[0];
+	int max = array[0].evaluation;
 	for (int i = 0; i < length; i++) {
-		if (array[i] > max) {
-			max = array[i];
+		if (array[i].evaluation > max) {
+			max = array[i].evaluation;
 			max_index = i;
 		}
 	}
 	return max_index;
 }
 
-int find_min_index(int array[], int length) { // Length must be greater than zero
+int find_min_index(Evaluated_Move array[], int length) { // Length must be greater than zero
 	int min_index = 0;
-	int min = array[0];
+	int min = array[0].evaluation;
 	for (int i = 0; i < length; i++) {
-		if (array[i] < min) {
-			min = array[i];
+		if (array[i].evaluation < min) {
+			min = array[i].evaluation;
 			min_index = i;
 		}
 	}
@@ -69,6 +75,7 @@ void print_move(Move *move) {
 }
 
 void print_position(Position *pp) {
+	//printf("Check: %d\n", pp->in_check);
 	int board[N][N];
 	memset(board, 0, sizeof(board));
 	board[pp->kings[0].row][pp->kings[0].col] = 9812;
@@ -157,14 +164,15 @@ int get_king_moves(Position *pp, Coord *move_array) {
 	return i;
 }
 
-Move *get_moves(Position *pp, Move *move_ptr) { // Returns pointer to end of array
+int get_moves(Position *pp, Evaluated_Move *move_ptr) { // Adds moves to array refrenced by move_ptr and returns number of moves added
+	Evaluated_Move *start_ptr = move_ptr;
 	Coord move_array[8];
 	if (pp->in_check) {
 		// Determine whether checking knight can be captured by knight
 		for (int i = 0; i < pp->number_of_knights[pp->turn]; i++) {
 			if (knight_attacks(&(pp->knights[pp->turn][i]), &(pp->checking_square))) {
-				move_ptr->start = pp->knights[pp->turn][i];
-				move_ptr->end = pp->checking_square;
+				move_ptr->move.start = pp->knights[pp->turn][i];
+				move_ptr->move.end = pp->checking_square;
 				move_ptr++;
 			}
 		}
@@ -173,8 +181,8 @@ Move *get_moves(Position *pp, Move *move_ptr) { // Returns pointer to end of arr
 		for (int i = 0; i < pp->number_of_knights[pp->turn]; i++) {
 			int number_of_possible_moves = get_knight_moves(pp, &(pp->knights[pp->turn][i]), move_array);
 			for (int j = 0; j < number_of_possible_moves; j++) {
-				move_ptr->start = pp->knights[pp->turn][i];
-				move_ptr->end = move_array[j];
+				move_ptr->move.start = pp->knights[pp->turn][i];
+				move_ptr->move.end = move_array[j];
 				move_ptr++;
 			}
 		}
@@ -182,11 +190,11 @@ Move *get_moves(Position *pp, Move *move_ptr) { // Returns pointer to end of arr
 	int number_of_possible_moves = get_king_moves(pp, move_array);
 	//printf("Found %d king moves.\n", number_of_possible_moves);
 	for (int j = 0; j < number_of_possible_moves; j++) {
-		move_ptr->start = pp->kings[pp->turn];
-		move_ptr->end = move_array[j];
+		move_ptr->move.start = pp->kings[pp->turn];
+		move_ptr->move.end = move_array[j];
 		move_ptr++;
 	}
-	return move_ptr;
+	return move_ptr - start_ptr;
 }
 
 int move_knight(Position *pp_new, Move *move) {
@@ -232,31 +240,81 @@ int game_over(Position *pp) {
 }
 
 int evaluate_position(Position *pp) {
-	return (pp->number_of_knights[0] + pp->checks[0]) - (pp->number_of_knights[1] + pp->checks[1]);
+	//printf("%d %d %d %d\n", pp->number_of_knights[0], pp->number_of_knights[1], pp->checks[0], pp->checks[1]);
+	return (1 * pp->number_of_knights[0] + 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] + 1 * pp->checks[1]);
 }
 
-void judge_position(Position *pp, Evaluated_Move *mp, int depth) {
-	positions_evaluated++;
-	if (depth == 0) {
-		mp->move = null_move;
-		mp->evaluation = 0;
-		return;
+Move get_best_move(Position *pp, int depth) {
+	Move best_move;
+	if (pp->turn == WHITE) {
+		best_move_of_white(pp, &best_move, -100, 100, depth);
 	}
-	Move move_array[8 * N];
-	int move_evaluation[8 * N];
-	Move *ptr = get_moves(pp, move_array);
-	int number_of_moves = ptr - move_array;
-	for (int i = 0; i < number_of_moves; i++) {
+	else {
+		best_move_of_black(pp, &best_move, -100, 100, depth);
+	}
+	return best_move;
+}
+
+void print_moves(Evaluated_Move *array, int n) {
+	for (int i = 0; i < n; i++) {
+		printf("Evaluation: %d\tMove: ", array[i].evaluation);
+		print_move(&array[i].move);
+	}
+}
+
+int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth) {
+	if (depth == 0) return evaluate_position(pp);
+	Evaluated_Move em_array[8 * N];
+	Move best_responses[8 * N];
+	int n = get_moves(pp, em_array); // Number of moves
+	for (int i = 0; i < n; i++) {
 		Position position_after_move;
-		make_move(pp, &position_after_move, &(move_array[i]));
-		Evaluated_Move move;
-		judge_position(&position_after_move, &move, depth - 1);
-		move_evaluation[i] = move.evaluation;
+		make_move(pp, &position_after_move, &em_array[i].move);
+		em_array[i].evaluation = best_move_of_black(&position_after_move, mp, alpha, beta, depth - 1);
+		if (em_array[i].evaluation >= beta) {
+			//printf("Black won't play this position: %d %d\n", em_array[i].evaluation, beta);
+			//print_position(&position_after_move);
+			return 100; // Black should avoid this branch
+		}
+		alpha = em_array[i].evaluation > alpha ? em_array[i].evaluation : alpha; 
 	}
-	int best_index = (pp->turn == WHITE) ? find_max_index(move_evaluation, number_of_moves) : find_min_index(move_evaluation, number_of_moves);
-	mp->move = move_array[best_index];
-	mp->evaluation = move_evaluation[best_index];
-	return;
+	int best_index = find_max_index(em_array, n);
+	*mp = em_array[best_index].move;
+	return em_array[best_index].evaluation;
+}
+
+int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth) {
+	if (depth == 0) return evaluate_position(pp);
+	Evaluated_Move em_array[8 * N];
+	int n = get_moves(pp, em_array); // Number of moves
+	for (int i = 0; i < n; i++) {
+		Position position_after_move;
+		make_move(pp, &position_after_move, &em_array[i].move);
+		em_array[i].evaluation = best_move_of_white(&position_after_move, mp, alpha, beta, depth - 1);
+		if (em_array[i].evaluation <= alpha) {
+			//printf("White won't play this position: %d %d\n", em_array[i].evaluation, alpha);
+			//print_position(&position_after_move);
+			return -100; // White should avoid this branch
+		}
+		beta = em_array[i].evaluation < beta ? em_array[i].evaluation : beta; 
+	}
+	int best_index = find_min_index(em_array, n);
+	*mp = em_array[best_index].move;
+	return em_array[best_index].evaluation;
+}
+
+int judge_position(Position *pp, Evaluated_Move *mp, int depth) {
+	positions_evaluated++;
+	if (depth == 0) return evaluate_position(pp);
+	Evaluated_Move em_array[8 * N];
+	int n = get_moves(pp, em_array); // Number of moves
+	for (int i = 0; i < n; i++) {
+		Position position_after_move;
+		make_move(pp, &position_after_move, &em_array[i].move);
+		em_array[i].evaluation = judge_position(&position_after_move, em_array + i, depth - 1);
+	}
+	int best_index = (pp->turn == WHITE) ? find_max_index(em_array, n) : find_min_index(em_array, n);
+	return em_array[best_index].evaluation;
 }
 
 void get_starting_position(Position *pp) {
@@ -279,6 +337,19 @@ void get_starting_position(Position *pp) {
 	pp->checking_square = (Coord){0, 0};
 }
 
+Move get_user_move(void) {
+	char buf[20] = {'\0'};
+	read(fileno(stdin), buf, 20);
+	printf("Read: %lu %s", strlen(buf), buf);
+	int c1, r1, c2, r2;
+	c1 = buf[0] - 'a';
+	r1 = buf[1] - '0';
+	c2 = buf[2] - 'a';
+	r2 = buf[3] - '0';
+	Move move = {{N - r1, c1}, {N - r2, c2}};
+	return move;
+}
+
 int main(int argc, char **argv) {
 	memset(str_pfx, ' ', sizeof(str_pfx));
 	str_pfx[0] = '\0';
@@ -286,10 +357,24 @@ int main(int argc, char **argv) {
 	Position position;
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
-	print_position(&position);
 	Evaluated_Move best_move;
-	judge_position(&position, &best_move, 6);
-	print_move(&(best_move.move));
-	printf("%d\n", positions_evaluated);
+	Position new_p;
+	while (1) {
+		print_position(&position);
+		printf("Move: \n");
+		Move move = get_user_move();
+		make_move(&position, &new_p, &move);
+		position = new_p;
+		print_position(&position);
+		move = get_best_move(&position, 2);
+		make_move(&position, &new_p, &move);
+		position = new_p;
+		printf("Response: ");
+		print_move(&move);
+	}
+	get_best_move(&position, 2);
+	//judge_position(&position, &best_move, 2);
+	//print_move(&(best_move.move));
+	//printf("%d\n", positions_evaluated);
 	return 0;
 }
