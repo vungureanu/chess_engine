@@ -6,10 +6,11 @@
 #include <locale.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 
 #define abs(x) ((x) < 0 ? -(x) : (x))
-#define N 5
-#define K (N-1)
+#define N 6
+#define K (N-2)
 #define WHITE 0
 #define BLACK 1
 #define HASH_DEPTH 5
@@ -26,8 +27,8 @@ typedef struct Coord {
 typedef struct Position { // Describes a position; 0 = white, 1 = black
 	Coord knights[2][N-1];
 	Coord kings[2];
-	uint8_t checks[2]; // Number of checks delivered
-	uint8_t number_of_knights[2]; // Number of knights remaining
+	int8_t checks[2]; // Number of checks delivered
+	int8_t number_of_knights[2]; // Number of knights remaining
 	uint8_t turn;
 	uint8_t in_check;
 	Coord checking_square;
@@ -59,10 +60,10 @@ int check_prime(int p, int *prime_array, int n);
 void print_position(Position *pp);
 
 int positions_evaluated = 0;
-char str_pfx[100];
-int str_index = 0;
 Evaluated_Position *hash_table;
 int hash_table_size;
+int hash_check = 0;
+int hash_hit = 0;
 
 uint64_t compress_position(Position *pp) { // Associates each position with a unique 64-bit integer
 	uint64_t cmp_white = 0, cmp_black = 0, result = 0;
@@ -78,7 +79,8 @@ uint64_t compress_position(Position *pp) { // Associates each position with a un
 	}
 	square = N * pp->kings[BLACK].row + pp->kings[BLACK].col;
 	cmp_black = cmp_black | (square << (K * 6));
-	return (uint64_t)((pp->turn) | (pp->checks[WHITE] << 1) | (pp->checks[BLACK] << 2) | (cmp_white << 3)) | (cmp_black << 33);
+	uint64_t prefix = (pp->turn) | (pp->checks[WHITE] << 1) | (pp->checks[BLACK] << 2);
+	return prefix | (cmp_white << 3) | (cmp_black << 33);
 }
 
 int hash(uint64_t position) {
@@ -86,19 +88,19 @@ int hash(uint64_t position) {
 }
 
 int check_hash(Position *pp, int depth) {
+	hash_check++;
 	uint64_t compressed_position = compress_position(pp);
 	int p_hash = hash(compressed_position);
 	for (int i = p_hash; i < p_hash + HASH_DEPTH; i++) {
 		if (hash_table[p_hash].compressed_position == compressed_position && hash_table[p_hash].depth >= depth) {
-			printf("Hash hit: %llu %llu\n", hash_table[p_hash].compressed_position, compressed_position);
-			print_position(pp);
-			printf("Evaluation: %d\n", hash_table[p_hash].evaluation);
+			hash_hit++;
+			//printf("Hash hit: %llu %llu\n", hash_table[p_hash].compressed_position, compressed_position);
+			//print_position(pp);
+			//printf("Evaluation: %d\n", hash_table[p_hash].evaluation);
 			hash_table[p_hash].visits++;
 			return hash_table[p_hash].evaluation;
 		}
 	}
-	//printf("Hash miss: %llu \n", compressed_position);
-	//print_position(pp);
 	return NOT_IN_HASH;
 }
 
@@ -176,8 +178,6 @@ void print_position(Position *pp) {
 		printf("\n");
 	}
 }
-
-Move null_move;
 
 int knight_attacks(Coord *knight_position, Coord *coord) {
 	int row_difference = abs(knight_position->row - coord->row);
@@ -265,7 +265,6 @@ int get_moves(Position *pp, Evaluated_Move *move_ptr) { // Adds moves to array r
 		}
 	}
 	int number_of_possible_moves = get_king_moves(pp, move_array);
-	//printf("Found %d king moves.\n", number_of_possible_moves);
 	for (int j = 0; j < number_of_possible_moves; j++) {
 		move_ptr->move.start = pp->kings[pp->turn];
 		move_ptr->move.end = move_array[j];
@@ -304,33 +303,52 @@ void make_move(Position *pp_old, Position *pp_new, Move *move) {
 	else {
 		pp_new->in_check = move_knight(pp_new, move);
 		pp_new->checking_square = move->end;
-		pp_new->checks[pp_new->turn] -= pp_new->in_check;
+		pp_new->checks[pp_new->turn] += pp_new->in_check;
 	}
 }
 
 int game_over(Position *pp) {
-	printf("GO\n");
-	if (pp->checks[0] == 0 || pp->checks[1] == 0) return 1;
+	if (pp->checks[0] == 3 || pp->checks[1] == 3) return 1;
 	if (pp->in_check == 0) return 0;
 	// Test for checkmate
 	return get_king_moves(pp, NULL) == 0;
 }
 
 int evaluate_position(Position *pp) {
-	//printf("%d %d %d %d\n", pp->number_of_knights[0], pp->number_of_knights[1], pp->checks[0], pp->checks[1]);
-	return (1 * pp->number_of_knights[0] + 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] + 1 * pp->checks[1]);
+	//print_position(pp);
+	//printf("%d %d %d %d\n", pp->number_of_knights[0], pp->checks[0], pp->number_of_knights[1], pp->checks[1]);
+	return (1 * pp->number_of_knights[0] - 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] - 1 * pp->checks[1]);
 }
 
-Move get_best_move(Position *pp, int depth) {
-	Move best_move;
-	add_to_hash(pp, 0, depth);
+Evaluated_Move get_best_move(Position *pp, int depth) {
+	Evaluated_Move best_move;
+	add_to_hash(pp, 0, depth); // If neither player can do better than a repetition of position occurs, the position is even
 	if (pp->turn == WHITE) {
-		best_move_of_white(pp, &best_move, -100, 100, depth);
+		best_move.evaluation = best_move_of_white(pp, &best_move.move, ALPHA_REJECT, BETA_REJECT, depth);
 	}
 	else {
-		best_move_of_black(pp, &best_move, -100, 100, depth);
+		best_move.evaluation = best_move_of_black(pp, &best_move.move, ALPHA_REJECT, BETA_REJECT, depth);
 	}
 	return best_move;
+}
+
+void evaluate_all(Position *pp, int depth) {
+	Evaluated_Move best_move;
+	Evaluated_Move em_array[8 * N];
+	Move best_responses[8 * N];
+	Position position_after_move;
+	int n = get_moves(pp, em_array); // Number of moves
+	for (int i = 0; i < n; i++) { // Evaluate each possible move
+		make_move(pp, &position_after_move, &em_array[i].move);
+		best_move = get_best_move(&position_after_move, depth - 1);
+		printf("Evaluation: %d ", best_move.evaluation);
+		print_move(&em_array[i].move);
+	}
+}
+
+void print_em(Evaluated_Move em) {
+	printf("Evaluation: %d\tMove: ", em.evaluation);
+	print_move(&em.move);
 }
 
 void print_moves(Evaluated_Move *array, int n) {
@@ -343,7 +361,6 @@ void print_moves(Evaluated_Move *array, int n) {
 int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth) { // Returns the evaluation of White's best move from the position "*pp"
 	if (depth == 0) return evaluate_position(pp);
 	Evaluated_Move em_array[8 * N];
-	Move best_responses[8 * N];
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of moves
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
@@ -369,9 +386,9 @@ int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth) {
 int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth) { // Returns the evaluation of Black's best move from the position "*pp"
 	if (depth == 0) return evaluate_position(pp);
 	Evaluated_Move em_array[8 * N];
+	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of moves
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
-		Position position_after_move;
 		make_move(pp, &position_after_move, &em_array[i].move);
 		int evaluation = check_hash(&position_after_move, depth);
 		if (evaluation != NOT_IN_HASH) {
@@ -388,8 +405,6 @@ int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth) {
 	}
 	int best_index = find_min_index(em_array, n);
 	*mp = em_array[best_index].move;
-	//print_position(pp);
-	//printf("%d evaluation\n", em_array[best_index].evaluation);
 	return em_array[best_index].evaluation;
 }
 
@@ -409,19 +424,17 @@ int judge_position(Position *pp, Evaluated_Move *mp, int depth) {
 
 void get_starting_position(Position *pp) {
 	int j = 0;
-	for (int i = 0; i < N; i++) {
-		if (i != (int)(N/2)) {
-			pp->knights[WHITE][j] = (Coord){N-1, i};
-			pp->knights[BLACK][j] = (Coord){0, i};
-			j++;
-		}
+	for (int i = 2; i < N; i++) {
+		pp->knights[WHITE][j] = (Coord){N-1, i};
+		pp->knights[BLACK][j] = (Coord){0, N-i-1};
+		j++;
 	}
-	pp->kings[WHITE] = (Coord){N-1, (int)(N/2)};
-	pp->kings[BLACK] = (Coord){0, (int)(N/2)};
+	pp->kings[WHITE] = (Coord){N-1, 0};
+	pp->kings[BLACK] = (Coord){0, N-1};
 	pp->checks[WHITE] = 3;
 	pp->checks[BLACK] = 3;
-	pp->number_of_knights[WHITE] = N-1;
-	pp->number_of_knights[BLACK] = N-1;
+	pp->number_of_knights[WHITE] = N-2;
+	pp->number_of_knights[BLACK] = N-2;
 	pp->turn = WHITE;
 	pp->in_check = 0;
 	pp->checking_square = (Coord){0, 0};
@@ -464,36 +477,59 @@ void print_hash(void) {
 	}
 }
 
+Position p;
+
+void set_test(void) {
+	p.knights[0][0] = (Coord){4, 0};
+	p.knights[0][1] = (Coord){4, 3};
+	p.knights[0][2] = (Coord){4, 4};
+	p.knights[1][0] = (Coord){0, 4};
+	p.knights[1][1] = (Coord){2, 3};
+	p.knights[1][2] = (Coord){4, 1};
+	p.kings[0] = (Coord){2, 4};
+	p.kings[1] = (Coord){0, 2};
+	p.checks[0] = 0;
+	p.checks[1] = 0;
+	p.number_of_knights[0] = 3;
+	p.number_of_knights[1] = 3;
+	p.turn = BLACK;
+	p.in_check = 0;
+	p.checking_square = (Coord){0, 0};
+}
+
 int main(int argc, char **argv) {
-	hash_table_size = 1000;
+	hash_table_size = 100000;
 	hash_table_size = get_prime(hash_table_size);
 	hash_table = calloc(hash_table_size, sizeof(Evaluated_Position));
 	memset(str_pfx, ' ', sizeof(str_pfx));
 	str_pfx[0] = '\0';
 	setlocale(LC_ALL, "");
+	set_test();
+	//print_position(&p);
+	//evaluate_all(&p, 5);
 	Position position;
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
+	print_position(&position);
 	Evaluated_Move best_move;
 	Position new_p;
 	while (1) {
 		print_position(&position);
-		printf("%llu", compress_position(&position));
 		printf("Move: \n");
 		Move move = get_user_move();
+		Evaluated_Move cmp_response;
 		make_move(&position, &new_p, &move);
 		position = new_p;
 		print_position(&position);
-		move = get_best_move(&position, 3);
-		make_move(&position, &new_p, &move);
+		clock_t t = clock();
+		evaluate_all(&position, 8);
+		cmp_response = get_best_move(&position, 8);
+		printf("Time: %lu\n", clock() - t);
+		make_move(&position, &new_p, &cmp_response.move);
 		position = new_p;
-		printf("Response: ");
-		print_move(&move);
-		print_hash();
+		//printf("Evaluation: %d", cmp_response.evaluation);
+		//print_hash();
+		printf("%d/%d\n", hash_hit, hash_check);
 	}
-	//get_best_move(&position, 2);
-	//judge_position(&position, &best_move, 2);
-	//print_move(&(best_move.move));
-	//printf("%d\n", positions_evaluated);
 	return 0;
 }
