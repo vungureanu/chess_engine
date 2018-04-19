@@ -7,6 +7,9 @@
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/stat.h>
 
 #define abs(x) ((x) < 0 ? -(x) : (x))
 #define N 6
@@ -14,9 +17,12 @@
 #define WHITE 0
 #define BLACK 1
 #define HASH_DEPTH 5
-#define NOT_IN_HASH 101 // Must be larger than greatest possible evaluation
+#define NOT_IN_HASH 200 // Must be larger than greatest possible evaluation
+#define IN_PROGRESS 201
 #define ALPHA_REJECT -102
 #define BETA_REJECT 102
+#define MAX_DEPTH 100
+#define HASH_FULL 202
 
 
 typedef struct Coord {
@@ -47,23 +53,39 @@ typedef struct Evaluated_Move {
 typedef struct Evaluated_Position {
 	uint64_t compressed_position;
 	int evaluation;
-	uint8_t visits;
 	uint8_t depth;
 } Evaluated_Position;
 
+typedef struct PDP {
+	Position *pp;
+	int depth;
+	Evaluated_Move *ptr;
+} PDP;
+
 void print_move(Move *move);
-int judge_position(Position *pp, Evaluated_Move *mp, int depth);
 int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth);
 int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth);
 void make_move(Position *pp_old, Position *pp_new, Move *move);
 int check_prime(int p, int *prime_array, int n);
 void print_position(Position *pp);
+void *get_best_move_wrapper(void *position_depth_and_ptr);
+void add_to_hash(uint64_t compressed_position, int evaluation, int depth, int index);
+int check_hash(uint64_t compressed_position, int depth, int *index);
+void print_em(Evaluated_Move em);
+// Check is a position is in the hash table.  If so, return its evaluation; if not, and there is space,
+// add it to the table and indicate its index in the table via "*index"
+int find_max_index(Evaluated_Move array[], int length);
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
+pthread_mutex_t *mutex_table;
 int hash_table_size;
 int hash_check = 0;
 int hash_hit = 0;
+int number_of_threads = 16;
+sem_t *thread_num;
+pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t hash_cond = PTHREAD_COND_INITIALIZER;
 
 uint64_t compress_position(Position *pp) { // Associates each position with a unique 64-bit integer
 	uint64_t cmp_white = 0, cmp_black = 0, result = 0;
@@ -84,46 +106,46 @@ uint64_t compress_position(Position *pp) { // Associates each position with a un
 }
 
 int hash(uint64_t position) {
-	return position % (hash_table_size - 1);
+	return position % hash_table_size;
 }
 
-int check_hash(Position *pp, int depth) {
+int check_hash(uint64_t compressed_position, int depth, int *index) {
 	hash_check++;
-	uint64_t compressed_position = compress_position(pp);
-	int p_hash = hash(compressed_position);
-	for (int i = p_hash; i < p_hash + HASH_DEPTH; i++) {
-		if (hash_table[p_hash].compressed_position == compressed_position && hash_table[p_hash].depth >= depth) {
-			hash_hit++;
-			//printf("Hash hit: %llu %llu\n", hash_table[p_hash].compressed_position, compressed_position);
-			//print_position(pp);
-			//printf("Evaluation: %d\n", hash_table[p_hash].evaluation);
-			hash_table[p_hash].visits++;
-			return hash_table[p_hash].evaluation;
-		}
-	}
-	return NOT_IN_HASH;
-}
-
-void add_to_hash(Position *pp, int evaluation, int depth) {
-	uint64_t compressed_position = compress_position(pp);
 	int p_hash = hash(compressed_position);
 	int worst_index = p_hash;
-	int worst_score = hash_table[p_hash].visits + pow(5, hash_table[p_hash].depth);
-	for (int i = p_hash; i < p_hash + HASH_DEPTH; i++) {
-		if (hash_table[p_hash].compressed_position == 0) { // Entry empty; can add forthwith
-			hash_table[worst_index] = (Evaluated_Position){compressed_position, evaluation, 0, depth};
-		}
-		int p_score = hash_table[i].visits + pow(5, hash_table[i].depth);
-		if (p_score < worst_score) {
-			worst_score = p_score;
-			worst_index = i % hash_table_size;
+	int worst_depth = MAX_DEPTH + 1;
+	for (int i = 0; i < HASH_DEPTH; i++) {
+		int index = (p_hash + i) % hash_table_size;
+		pthread_mutex_lock(mutex_table + index);
+		if (hash_table[index].evaluation != IN_PROGRESS) { // Do not overwrite pending evaluation
+			if (hash_table[index].depth < worst_depth) {
+				worst_depth = hash_table[index].depth;
+				worst_index = index;
+			}
+			if (hash_table[index].compressed_position == compressed_position && hash_table[index].depth >= depth) {
+				hash_hit++;
+				for (int j = 0; j <= i; j++) pthread_mutex_unlock(mutex_table + (p_hash + j) % hash_table_size);
+				return hash_table[index].evaluation;
+			}
 		}
 	}
-	if (worst_score <= pow(5, depth)) hash_table[worst_index] = (Evaluated_Position){compressed_position, evaluation, 0, depth};
+	if (worst_depth != MAX_DEPTH + 1) { // Space found in hash table
+		hash_table[worst_index].compressed_position = compressed_position;
+		hash_table[worst_index].evaluation = IN_PROGRESS;
+		for (int i = 0; i < HASH_DEPTH; i++) pthread_mutex_unlock(mutex_table + (p_hash + i) % hash_table_size);
+		*index = worst_index;
+		return NOT_IN_HASH;
+	}
+	for (int i = 0; i < HASH_DEPTH; i++) pthread_mutex_unlock(mutex_table + (p_hash + i) % hash_table_size);
+	return HASH_FULL;
 }
 
-double score(Evaluated_Position *pp) { // Return the usefulness of a position in the hash table
-	return pp->visits + pow(5, pp->depth);
+void add_to_hash(uint64_t compressed_position, int evaluation, int depth, int index) {
+	pthread_mutex_lock(mutex_table + index);
+	hash_table[index].compressed_position = compressed_position;
+	hash_table[index].evaluation = evaluation;
+	hash_table[index].depth = depth;
+	pthread_mutex_unlock(mutex_table + index);
 }
 
 int find_max_index(Evaluated_Move array[], int length) { // Length must be greater than zero
@@ -322,7 +344,7 @@ int evaluate_position(Position *pp) {
 
 Evaluated_Move get_best_move(Position *pp, int depth) {
 	Evaluated_Move best_move;
-	add_to_hash(pp, 0, depth); // If neither player can do better than a repetition of position occurs, the position is even
+	//add_to_hash(pp, 0, depth); // If neither player can do better than a repetition of position occurs, the position is even
 	if (pp->turn == WHITE) {
 		best_move.evaluation = best_move_of_white(pp, &best_move.move, ALPHA_REJECT, BETA_REJECT, depth);
 	}
@@ -332,18 +354,64 @@ Evaluated_Move get_best_move(Position *pp, int depth) {
 	return best_move;
 }
 
-void evaluate_all(Position *pp, int depth) {
+void *get_best_move_wrapper(void *position_depth_and_ptrs) {
+	PDP args = *((PDP *)position_depth_and_ptrs);
+	(*(args.ptr)).evaluation = get_best_move(args.pp, args.depth).evaluation;
+	sem_post(thread_num);
+	return NULL;
+}
+
+Move evaluate_all(Position *pp, int depth) {
+	Evaluated_Move em_array[8 * N];
+	Position position_after_move[8 * N];
+	pthread_t tid[number_of_threads];
+	int n = get_moves(pp, em_array); // Number of moves
+	PDP args[n];
+	int i = 0;
+	int thread_index = 0;
+	sem_unlink("/semaphore");
+	thread_num = sem_open("/semaphore", O_CREAT | O_EXCL, S_IRWXU, number_of_threads);
+	if (thread_num == SEM_FAILED) {
+		printf("Error establishing semaphore.\n");
+		exit(1);
+	}
+	while (i < n) {
+		sem_wait(thread_num);
+		make_move(pp, position_after_move + i, &em_array[i].move);
+		args[i] = (PDP){position_after_move + i, depth, em_array + i};
+		pthread_create(tid + thread_index, NULL, get_best_move_wrapper, (void *)(args + i));
+		thread_index = (thread_index + 1) % number_of_threads;
+		i++;
+	}
+	for (int j = 0; j < number_of_threads; j++) {
+		pthread_join(tid[j], NULL);
+	}
+	int best_index = 0;
+	for (int j = 0; j < n; j++) {
+		print_em(em_array[j]);
+	}
+	sem_close(thread_num);
+	sem_unlink("/semaphore");
+	int index = pp->turn == WHITE ? find_max_index(em_array, n) : find_min_index(em_array, n);
+	return em_array[index].move;
+}
+
+Evaluated_Move e2(Position *pp, int depth) {
 	Evaluated_Move best_move;
 	Evaluated_Move em_array[8 * N];
-	Move best_responses[8 * N];
+	Evaluated_Move best_responses[8 * N];
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of moves
-	for (int i = 0; i < n; i++) { // Evaluate each possible move
+	for (int i = 0; i < n; i++) {
 		make_move(pp, &position_after_move, &em_array[i].move);
-		best_move = get_best_move(&position_after_move, depth - 1);
-		printf("Evaluation: %d ", best_move.evaluation);
-		print_move(&em_array[i].move);
+		best_move = get_best_move(&position_after_move, depth);
 	}
+	printf("Done.\n");
+	for (int j = 0; j < n; j++) {
+		printf("Evaluation: %d ", best_move.evaluation);
+		print_move(&em_array[j].move);
+	}
+	return best_move;
 }
 
 void print_em(Evaluated_Move em) {
@@ -364,16 +432,23 @@ int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth) {
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of moves
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
+		int hash_index;
 		make_move(pp, &position_after_move, &em_array[i].move);
-		int evaluation = check_hash(&position_after_move, depth);
-		if (evaluation != NOT_IN_HASH) {
-			em_array[i].evaluation = evaluation;
-		}
-		else {
+		uint64_t compressed_position = compress_position(&position_after_move);
+		int evaluation = check_hash(compressed_position, depth, &hash_index);
+		if (evaluation == NOT_IN_HASH) {
 			em_array[i].evaluation = best_move_of_black(&position_after_move, mp, alpha, beta, depth - 1);
 			if (em_array[i].evaluation != ALPHA_REJECT && em_array[i].evaluation != BETA_REJECT) {
-				add_to_hash(&position_after_move, em_array[i].evaluation, depth);
+				add_to_hash(compressed_position, em_array[i].evaluation, depth, hash_index);
 			}
+		}
+		else if (evaluation == HASH_FULL || evaluation == IN_PROGRESS) {
+			// Proceed with evaluation, but do not add to hash
+			em_array[i].evaluation = best_move_of_black(&position_after_move, mp, alpha, beta, depth - 1);
+		}
+		else {
+			// Found in hash table
+			em_array[i].evaluation = evaluation;
 		}
 		if (em_array[i].evaluation >= beta) return BETA_REJECT; // Black should avoid this branch
 		alpha = em_array[i].evaluation > alpha ? em_array[i].evaluation : alpha; 
@@ -389,36 +464,29 @@ int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth) {
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of moves
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
+		int hash_index;
 		make_move(pp, &position_after_move, &em_array[i].move);
-		int evaluation = check_hash(&position_after_move, depth);
-		if (evaluation != NOT_IN_HASH) {
-			em_array[i].evaluation = evaluation;
-		}
-		else {
+		uint64_t compressed_position = compress_position(&position_after_move);
+		int evaluation = check_hash(compressed_position, depth, &hash_index);
+		if (evaluation == NOT_IN_HASH) {
 			em_array[i].evaluation = best_move_of_white(&position_after_move, mp, alpha, beta, depth - 1);
 			if (em_array[i].evaluation != ALPHA_REJECT && em_array[i].evaluation != BETA_REJECT) {
-				add_to_hash(&position_after_move, em_array[i].evaluation, depth);
+				add_to_hash(compressed_position, em_array[i].evaluation, depth, hash_index);
 			}
+		}
+		else if (evaluation == HASH_FULL || evaluation == IN_PROGRESS) {
+			// Proceed with evaluation, but do not add to hash
+			em_array[i].evaluation = best_move_of_white(&position_after_move, mp, alpha, beta, depth - 1);
+		}
+		else {
+			// Found in hash table
+			em_array[i].evaluation = evaluation;
 		}
 		if (em_array[i].evaluation <= alpha) return ALPHA_REJECT; // White should avoid this branch
 		beta = em_array[i].evaluation < beta ? em_array[i].evaluation : beta; 
 	}
 	int best_index = find_min_index(em_array, n);
 	*mp = em_array[best_index].move;
-	return em_array[best_index].evaluation;
-}
-
-int judge_position(Position *pp, Evaluated_Move *mp, int depth) {
-	positions_evaluated++;
-	if (depth == 0) return evaluate_position(pp);
-	Evaluated_Move em_array[8 * N];
-	int n = get_moves(pp, em_array); // Number of moves
-	for (int i = 0; i < n; i++) {
-		Position position_after_move;
-		make_move(pp, &position_after_move, &em_array[i].move);
-		em_array[i].evaluation = judge_position(&position_after_move, em_array + i, depth - 1);
-	}
-	int best_index = (pp->turn == WHITE) ? find_max_index(em_array, n) : find_min_index(em_array, n);
 	return em_array[best_index].evaluation;
 }
 
@@ -480,14 +548,14 @@ void print_hash(void) {
 Position p;
 
 void set_test(void) {
-	p.knights[0][0] = (Coord){4, 0};
-	p.knights[0][1] = (Coord){4, 3};
-	p.knights[0][2] = (Coord){4, 4};
-	p.knights[1][0] = (Coord){0, 4};
-	p.knights[1][1] = (Coord){2, 3};
-	p.knights[1][2] = (Coord){4, 1};
-	p.kings[0] = (Coord){2, 4};
-	p.kings[1] = (Coord){0, 2};
+	p.knights[0][0] = (Coord){5, 2};
+	p.knights[0][1] = (Coord){3, 4};
+	p.knights[0][2] = (Coord){2, 3};
+	p.knights[1][0] = (Coord){4, 3};
+	p.knights[1][1] = (Coord){2, 1};
+	p.knights[1][2] = (Coord){0, 0};
+	p.kings[0] = (Coord){2, 0};
+	p.kings[1] = (Coord){0, 5};
 	p.checks[0] = 0;
 	p.checks[1] = 0;
 	p.number_of_knights[0] = 3;
@@ -501,35 +569,48 @@ int main(int argc, char **argv) {
 	hash_table_size = 100000;
 	hash_table_size = get_prime(hash_table_size);
 	hash_table = calloc(hash_table_size, sizeof(Evaluated_Position));
-	memset(str_pfx, ' ', sizeof(str_pfx));
-	str_pfx[0] = '\0';
+	mutex_table = calloc(hash_table_size, sizeof(pthread_mutex_t));
+	for (int i = 0; i < hash_table_size; i++) pthread_mutex_init(mutex_table + i, NULL);
 	setlocale(LC_ALL, "");
-	set_test();
+	//set_test();
 	//print_position(&p);
-	//evaluate_all(&p, 5);
+	//evaluate_all(&p, 7);
 	Position position;
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
-	print_position(&position);
+	//print_position(&position);
 	Evaluated_Move best_move;
 	Position new_p;
 	while (1) {
 		print_position(&position);
 		printf("Move: \n");
 		Move move = get_user_move();
-		Evaluated_Move cmp_response;
 		make_move(&position, &new_p, &move);
+		time_t t1, t2;
 		position = new_p;
 		print_position(&position);
-		clock_t t = clock();
-		evaluate_all(&position, 8);
-		cmp_response = get_best_move(&position, 8);
-		printf("Time: %lu\n", clock() - t);
-		make_move(&position, &new_p, &cmp_response.move);
+		time(&t1);
+		Move cmp_response = evaluate_all(&position, 7);
+		make_move(&position, &new_p, &cmp_response);
+		//position = new_p;
+		//time(&t2);
+		//printf("Time: %f\n", difftime(t2, t1));
+		printf("%d/%d\n", hash_hit, hash_check);
+		hash_hit = 0;
+		hash_check = 0;
+		memset(hash_table, 0, sizeof(Evaluated_Position) * hash_table_size);
+		Evaluated_Move cr;
+		//print_position(&position);
+		//cr = e2(&position, 7);
+		//print_em(cr);
 		position = new_p;
+		//time(&t1);
+		//printf("Time: %f\n", difftime(t1, t2));
+		//make_move(&position, &new_p, &cr.move);
+		//position = new_p;
 		//printf("Evaluation: %d", cmp_response.evaluation);
 		//print_hash();
-		printf("%d/%d\n", hash_hit, hash_check);
+		//printf("%d/%d\n", hash_hit, hash_check);
 	}
 	return 0;
 }
