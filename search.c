@@ -5,11 +5,10 @@
 #include <stdlib.h>
 #include <locale.h>
 #include <stdint.h>
-#include <math.h>
 #include <time.h>
-#include <pthread.h>
 #include <semaphore.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #define abs(x) ((x) < 0 ? -(x) : (x))
 #define N 6
@@ -23,7 +22,9 @@
 #define BETA_REJECT 102
 #define MAX_DEPTH 100
 #define HASH_FULL 202
-
+#define CAPTURE 1
+#define CHECK 1
+#define POSSIBLE_VALUES 4 // The number of possible values a move can have; used to determine the order in which moves are evaluated
 
 typedef struct Coord {
 	int8_t row;
@@ -43,6 +44,7 @@ typedef struct Position { // Describes a position; 0 = white, 1 = black
 typedef struct Move {
 	Coord start;
 	Coord end;
+	int move_value;
 } Move;
 
 typedef struct Evaluated_Move {
@@ -62,7 +64,13 @@ typedef struct PDP {
 	Evaluated_Move *ptr;
 } PDP;
 
+typedef struct LL_Node {
+	Move *move;
+	struct LL_Node *next_node;
+} LL_Node;
+
 void print_move(Move *move);
+int get_moves(Position *pp, Evaluated_Move *mp); // Adds moves to "mp" in decreasing order of promise and returns number of moves added
 int best_move_of_white(Position *pp, Move *mp, int alpha, int beta, int depth);
 int best_move_of_black(Position *pp, Move *mp, int alpha, int beta, int depth);
 void make_move(Position *pp_old, Position *pp_new, Move *move);
@@ -71,15 +79,16 @@ void print_position(Position *pp);
 void *get_best_move_wrapper(void *position_depth_and_ptr);
 void add_to_hash(uint64_t compressed_position, int evaluation, int depth, int index);
 int check_hash(uint64_t compressed_position, int depth, int *index);
+// Check if a position is in the hash table.  If so, return its evaluation; if not, and there is space,
+// add it to the table and set "*index" accordingly
 void print_em(Evaluated_Move em);
-// Check is a position is in the hash table.  If so, return its evaluation; if not, and there is space,
-// add it to the table and indicate its index in the table via "*index"
+int occupied_opponent(Position *pp, Coord *coord);
 int find_max_index(Evaluated_Move array[], int length);
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
 pthread_mutex_t *mutex_table;
-int hash_table_size;
+int hash_table_size = 99991;
 int hash_check = 0;
 int hash_hit = 0;
 int number_of_threads = 16;
@@ -181,24 +190,19 @@ void print_position(Position *pp) {
 	memset(board, 0, sizeof(board));
 	board[pp->kings[0].row][pp->kings[0].col] = 9812;
 	board[pp->kings[1].row][pp->kings[1].col] = 9818;
-	for (int i = 0; i < pp->number_of_knights[0]; i++) {
-		board[pp->knights[0][i].row][pp->knights[0][i].col] = 9816;
-	}
-	for (int i = 0; i < pp->number_of_knights[1]; i++) {
-		board[pp->knights[1][i].row][pp->knights[1][i].col] = 9822;
-	}
+	for (int i = 0; i < pp->number_of_knights[0]; i++) board[pp->knights[0][i].row][pp->knights[0][i].col] = 9816;
+	for (int i = 0; i < pp->number_of_knights[1]; i++) board[pp->knights[1][i].row][pp->knights[1][i].col] = 9822;
 	for (int i = 0; i < N; i++) {
-		printf("|");
+		printf("%c |", '0' + (N-i));
 		for (int j = 0; j < N; j++) {
-			if (board[i][j] != 0) {
-				printf("%lc|", board[i][j]);
-			}
-			else {
-				printf(" |");
-			}
+			if (board[i][j] != 0) printf("%lc|", board[i][j]);
+			else printf(" |");
 		}
 		printf("\n");
 	}
+	printf("  ");
+	for (int i = 0; i < N; i++) printf(" %c", 'a' + i);
+	printf("\n");
 }
 
 int knight_attacks(Coord *knight_position, Coord *coord) {
@@ -227,6 +231,13 @@ int occupied_by(Position *pp, Coord *coord) {
 		if (coord->row == pp->knights[pp->turn][i].row && coord->col == pp->knights[pp->turn][i].col) return i;
 	}
 	return -1;
+}
+
+int occupied_opponent(Position *pp, Coord *coord) {
+	for (int i = 0; i < pp->number_of_knights[1-pp->turn]; i++) {
+		if (coord->row == pp->knights[1-pp->turn][i].row && coord->col == pp->knights[1-pp->turn][i].col) return 1;
+	}
+	return 0;
 }
 
 int get_knight_moves(Position *pp, Coord *coord, Coord *move_array) {
@@ -263,36 +274,65 @@ int get_king_moves(Position *pp, Coord *move_array) {
 	return i;
 }
 
-int get_moves(Position *pp, Evaluated_Move *move_ptr) { // Adds moves to array refrenced by move_ptr and returns number of moves added
-	Evaluated_Move *start_ptr = move_ptr;
+void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node **roots, LL_Node *nodes) {
+	array[n].start = *start;
+	array[n].end = *end;
+	nodes[n].move = array + n;
+	nodes[n].next_node = *(roots + value);
+	*(roots + value) = nodes + n;
+}
+
+int get_moves(Position *pp, Evaluated_Move *mp) {
+	Evaluated_Move *start_ptr = mp;
 	Coord move_array[8];
+	LL_Node null_node = {NULL, NULL};
+	LL_Node *roots[POSSIBLE_VALUES];
+	for (int i = 0; i < POSSIBLE_VALUES; i++) roots[i] = &null_node;
+	LL_Node nodes[8 * (K+1)];
+	Move tmp_array[8 * (K+1)];
+	int n = 0;
 	if (pp->in_check) {
 		// Determine whether checking knight can be captured by knight
 		for (int i = 0; i < pp->number_of_knights[pp->turn]; i++) {
-			if (knight_attacks(&(pp->knights[pp->turn][i]), &(pp->checking_square))) {
-				move_ptr->move.start = pp->knights[pp->turn][i];
-				move_ptr->move.end = pp->checking_square;
-				move_ptr++;
+			Coord *start = &(pp->knights[pp->turn][i]);
+			Coord *end = &(pp->checking_square);
+			if (knight_attacks(start, end)) {
+				Coord *king = &(pp->kings[1-pp->turn]);
+				int value = CAPTURE + CHECK * knight_attacks(end, king);
+				add_move(start, end, value, tmp_array, n, roots, nodes);
+				n++;
 			}
 		}
 	}
 	else {
 		for (int i = 0; i < pp->number_of_knights[pp->turn]; i++) {
-			int number_of_possible_moves = get_knight_moves(pp, &(pp->knights[pp->turn][i]), move_array);
+			Coord *start = &(pp->knights[pp->turn][i]);
+			Coord *king = &(pp->kings[1-pp->turn]);
+			int number_of_possible_moves = get_knight_moves(pp, start, move_array);
 			for (int j = 0; j < number_of_possible_moves; j++) {
-				move_ptr->move.start = pp->knights[pp->turn][i];
-				move_ptr->move.end = move_array[j];
-				move_ptr++;
+				int value = CAPTURE * occupied_opponent(pp, move_array + j) + CHECK * knight_attacks(move_array + j, king);
+				add_move(start, move_array + j, value, tmp_array, n, roots, nodes);
+				n++;
 			}
 		}
 	}
 	int number_of_possible_moves = get_king_moves(pp, move_array);
+	Coord *start = &(pp->kings[pp->turn]);
 	for (int j = 0; j < number_of_possible_moves; j++) {
-		move_ptr->move.start = pp->kings[pp->turn];
-		move_ptr->move.end = move_array[j];
-		move_ptr++;
+		int value = CAPTURE * occupied_opponent(pp, move_array + j);
+		add_move(start, move_array + j, value, tmp_array, n, roots, nodes);
+		n++;
 	}
-	return move_ptr - start_ptr;
+	int index = n-1;
+	for (int i = 0; i < POSSIBLE_VALUES; i++) {
+		LL_Node *ptr = *(roots + i);
+		while (ptr->next_node != NULL) {
+			mp[index].move = *(ptr->move);
+			ptr = ptr->next_node;
+			index--;
+		}
+	}
+	return n;
 }
 
 int move_knight(Position *pp_new, Move *move) {
@@ -394,24 +434,6 @@ Move evaluate_all(Position *pp, int depth) {
 	sem_unlink("/semaphore");
 	int index = pp->turn == WHITE ? find_max_index(em_array, n) : find_min_index(em_array, n);
 	return em_array[index].move;
-}
-
-Evaluated_Move e2(Position *pp, int depth) {
-	Evaluated_Move best_move;
-	Evaluated_Move em_array[8 * N];
-	Evaluated_Move best_responses[8 * N];
-	Position position_after_move;
-	int n = get_moves(pp, em_array); // Number of moves
-	for (int i = 0; i < n; i++) {
-		make_move(pp, &position_after_move, &em_array[i].move);
-		best_move = get_best_move(&position_after_move, depth);
-	}
-	printf("Done.\n");
-	for (int j = 0; j < n; j++) {
-		printf("Evaluation: %d ", best_move.evaluation);
-		print_move(&em_array[j].move);
-	}
-	return best_move;
 }
 
 void print_em(Evaluated_Move em) {
@@ -545,6 +567,14 @@ void print_hash(void) {
 	}
 }
 
+void sig_exit(int sig_num) {
+	sem_close(thread_num);
+	free(hash_table);
+	free(mutex_table);
+	printf("\n");
+	exit(0);
+}
+
 Position p;
 
 void set_test(void) {
@@ -565,21 +595,37 @@ void set_test(void) {
 	p.checking_square = (Coord){0, 0};
 }
 
+int parse_options(int argc, char **argv) {
+	int option;
+	while ((option = getopt(argc, argv, "h:t:")) != -1) {
+		switch (option) {
+			long arg;
+			case 'h':
+				arg = strtol(optarg, NULL, 10);
+				if (arg == 0 || arg > 1000000) printf("Invalid argument given to \"-h\".  Please enter an integer between 1 and 1000000.\n");
+				else hash_table_size = (int)arg;
+				break;
+			case 't':
+				arg = strtol(optarg, NULL, 10);
+				if (arg == 0 || arg > 64) printf("Invalid argument given to \"-t\".  Please enter an integer between 1 and 64.\n");
+				else hash_table_size = (int)arg;
+				break;
+		}
+	}
+	return 0;
+}
+
 int main(int argc, char **argv) {
-	hash_table_size = 100000;
-	hash_table_size = get_prime(hash_table_size);
+	parse_options(argc, argv);
+	signal(SIGINT, sig_exit);
 	hash_table = calloc(hash_table_size, sizeof(Evaluated_Position));
 	mutex_table = calloc(hash_table_size, sizeof(pthread_mutex_t));
 	for (int i = 0; i < hash_table_size; i++) pthread_mutex_init(mutex_table + i, NULL);
 	setlocale(LC_ALL, "");
-	//set_test();
-	//print_position(&p);
-	//evaluate_all(&p, 7);
 	Position position;
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
-	//print_position(&position);
-	Evaluated_Move best_move;
+	Evaluated_Move moves[40];
 	Position new_p;
 	while (1) {
 		print_position(&position);
@@ -590,7 +636,7 @@ int main(int argc, char **argv) {
 		position = new_p;
 		print_position(&position);
 		time(&t1);
-		Move cmp_response = evaluate_all(&position, 7);
+		Move cmp_response = evaluate_all(&position, 8);
 		make_move(&position, &new_p, &cmp_response);
 		//position = new_p;
 		//time(&t2);
@@ -600,17 +646,7 @@ int main(int argc, char **argv) {
 		hash_check = 0;
 		memset(hash_table, 0, sizeof(Evaluated_Position) * hash_table_size);
 		Evaluated_Move cr;
-		//print_position(&position);
-		//cr = e2(&position, 7);
-		//print_em(cr);
 		position = new_p;
-		//time(&t1);
-		//printf("Time: %f\n", difftime(t1, t2));
-		//make_move(&position, &new_p, &cr.move);
-		//position = new_p;
-		//printf("Evaluation: %d", cmp_response.evaluation);
-		//print_hash();
-		//printf("%d/%d\n", hash_hit, hash_check);
 	}
 	return 0;
 }
