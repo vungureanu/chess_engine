@@ -18,17 +18,19 @@
 #define HASH_DEPTH 5
 #define NOT_IN_HASH 200 // Must be larger than greatest possible evaluation
 #define IN_PROGRESS 201
-#define ALPHA_REJECT -102
-#define BETA_REJECT 102
+#define ALPHA_REJECT -121
+#define BETA_REJECT 121
 #define MAX_DEPTH 100
 #define HASH_FULL 202
-#define WHITE_WINS 101
-#define BLACK_WINS -101
 #define STALEMATE 0
 #define CAPTURE 1
 #define CHECK 1
 #define POSSIBLE_VALUES 4 // The number of possible values a move can have; used to determine the order in which moves are evaluated
 #define SHALLOW_SEARCH_DEPTH 5
+#define FORCED_WIN_BLACK -101
+#define FORCED_WIN_WHITE 101
+#define BLACK_WINS -120
+#define WHITE_WINS 120
 
 typedef struct Coord {
 	int8_t row;
@@ -40,8 +42,8 @@ typedef struct Position { // Describes a position; 0 = white, 1 = black
 	Coord kings[2];
 	int8_t checks[2]; // Number of checks remaining
 	int8_t number_of_knights[2]; // Number of knights remaining
-	uint8_t turn;
-	uint8_t in_check;
+	int8_t turn;
+	int8_t in_check;
 	Coord checking_square;
 } Position;
 
@@ -59,7 +61,7 @@ typedef struct Evaluated_Move {
 typedef struct Evaluated_Position {
 	uint64_t compressed_position;
 	int evaluation;
-	uint8_t depth;
+	int8_t depth;
 } Evaluated_Position;
 
 typedef struct PDP {
@@ -73,7 +75,9 @@ typedef struct LL_Node {
 	struct LL_Node *next_node;
 } LL_Node;
 
-void print_move(Move *move);
+typedef enum Mode {THREE_CHECKS, KINGS_CROSS} Mode;
+typedef enum Move_Type {KING_MOVE, KNIGHT_MOVE} Move_Type;
+
 int get_moves(Position *pp, Evaluated_Move *mp);
 // Adds moves to "mp" in decreasing order of expected value and returns number of moves added.
 void make_move(Position *pp_old, Position *pp_new, Move *move);
@@ -100,6 +104,7 @@ void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node *
 int parse_options(int argc, char **argv);
 // Allows user to set number of threads and hash table size.
 int shallow_reject(Position *pp, int alpha, int beta, int *flag);
+int evaluate_position(Position *pp, Mode mode);
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
@@ -200,10 +205,6 @@ int find_min_index(Evaluated_Move array[], int length) { // Length must be great
 	return min_index;
 }
 
-void print_move(Move *move) {
-	printf("(%d, %d) to (%d, %d)\n", move->start.row, move->start.col, move->end.row, move->end.col);
-}
-
 void print_position(Position *pp) {
 	int board[N][N];
 	memset(board, 0, sizeof(board));
@@ -301,6 +302,22 @@ void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node *
 	*(roots + value) = nodes + n;
 }
 
+int ev(Position *pp, Coord *start, Coord *end, Move_Type move_type, Mode mode) {
+	if (mode == THREE_CHECKS) {
+		if (move_type == KING_MOVE) return occupied_opponent(pp, end);
+		if (move_type == KNIGHT_MOVE) return occupied_opponent(pp, end) + knight_attacks(end, &(pp->kings[1-pp->turn]));
+	}
+	if (mode == KINGS_CROSS) {
+		if (move_type == KING_MOVE) {
+			int rows_forward = (pp->turn == WHITE) ? start->row - end->row : end->row - start->row;
+			return occupied_opponent(pp, end) + rows_forward;
+		}
+		if (move_type == KNIGHT_MOVE) return occupied_opponent(pp, end);
+	}
+	exit(0);
+	return 0;
+}
+
 int get_moves(Position *pp, Evaluated_Move *mp) {
 	Evaluated_Move *start_ptr = mp;
 	Coord move_array[8];
@@ -316,8 +333,7 @@ int get_moves(Position *pp, Evaluated_Move *mp) {
 			Coord *start = &(pp->knights[pp->turn][i]);
 			Coord *end = &(pp->checking_square);
 			if (knight_attacks(start, end)) {
-				Coord *king = &(pp->kings[1-pp->turn]);
-				int value = CAPTURE + CHECK * knight_attacks(end, king);
+				int value = ev(pp, start, end, KNIGHT_MOVE, THREE_CHECKS);
 				add_move(start, end, value, tmp_array, n, roots, nodes);
 				n++;
 			}
@@ -329,7 +345,7 @@ int get_moves(Position *pp, Evaluated_Move *mp) {
 			Coord *king = &(pp->kings[1-pp->turn]);
 			int number_of_possible_moves = get_knight_moves(pp, start, move_array);
 			for (int j = 0; j < number_of_possible_moves; j++) {
-				int value = CAPTURE * occupied_opponent(pp, move_array + j) + CHECK * knight_attacks(move_array + j, king);
+				int value = ev(pp, start, move_array + j, KNIGHT_MOVE, THREE_CHECKS);
 				add_move(start, move_array + j, value, tmp_array, n, roots, nodes);
 				n++;
 			}
@@ -338,7 +354,7 @@ int get_moves(Position *pp, Evaluated_Move *mp) {
 	int number_of_possible_moves = get_king_moves(pp, move_array);
 	Coord *start = &(pp->kings[pp->turn]);
 	for (int j = 0; j < number_of_possible_moves; j++) {
-		int value = CAPTURE * occupied_opponent(pp, move_array + j);
+		int value = ev(pp, start, move_array + j, KING_MOVE, THREE_CHECKS);
 		add_move(start, move_array + j, value, tmp_array, n, roots, nodes);
 		n++;
 	}
@@ -388,53 +404,63 @@ void make_move(Position *pp_old, Position *pp_new, Move *move) {
 	}
 }
 
-int game_over(Position *pp, int available_moves, int *flag) {
-	if (pp->checks[WHITE] == 0) {
-		*flag = BLACK_WINS;
-		return 1;
-	}
-	if (pp->checks[BLACK] == 0) {
-		*flag = WHITE_WINS;
-		return 1;
-	}
-	if (available_moves == 0) {
-		if (pp->in_check) {
-			if (pp->turn == WHITE) *flag = BLACK_WINS;
-			else *flag = WHITE_WINS;
+int game_over(Position *pp, int available_moves, int *flag, Mode mode) {
+	if (mode == THREE_CHECKS) {
+		if (pp->checks[WHITE] == 0) {
+			*flag = BLACK_WINS;
+			return 1;
 		}
-		else *flag = STALEMATE;
-		return 1;
+		if (pp->checks[BLACK] == 0) {
+			*flag = WHITE_WINS;
+			return 1;
+		}
+		if (available_moves == 0) {
+			if (pp->in_check) {
+				if (pp->turn == WHITE) *flag = BLACK_WINS;
+				else *flag = WHITE_WINS;
+			}
+			else *flag = STALEMATE;
+			return 1;
+		}
+		return 0;
 	}
+	if (mode == KINGS_CROSS) {
+		if (pp->kings[WHITE].row == 0) return WHITE_WINS;
+		if (pp->kings[BLACK].row == N-1) return BLACK_WINS;
+		if (available_moves == 0) {
+			if (pp->in_check) {
+				if (pp->turn == WHITE) *flag = BLACK_WINS;
+				else *flag = WHITE_WINS;
+			}
+			else *flag = STALEMATE;
+			return 1;
+		}
+		return 0;
+	}
+	exit(0);
 	return 0;
 }
 
-int evaluate_position(Position *pp) {
-	//print_position(pp);
-	//printf("%d %d %d %d\n", pp->number_of_knights[0], pp->checks[0], pp->number_of_knights[1], pp->checks[1]);
-	return (1 * pp->number_of_knights[0] + 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] + 1 * pp->checks[1]);
-}
-
-Evaluated_Move get_best_move(Position *pp, int depth) {
-	Evaluated_Move best_move;
-	//add_to_hash(pp, 0, depth); // If neither player can do better than a repetition of position occurs, the position is even
-	if (pp->turn == WHITE) {
-		best_move.evaluation = find_best_move(pp, &best_move.move, ALPHA_REJECT, BETA_REJECT, depth);
+int evaluate_position(Position *pp, Mode mode) {
+	if (mode == THREE_CHECKS) {
+		return (1 * pp->number_of_knights[0] + 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] + 1 * pp->checks[1]);
 	}
-	else {
-		best_move.evaluation = find_best_move(pp, &best_move.move, ALPHA_REJECT, BETA_REJECT, depth);
-	}
-	return best_move;
+	if (mode == KINGS_CROSS) return (pp->number_of_knights[WHITE] + (N - pp->kings[WHITE].row)) - (pp->number_of_knights[BLACK] + pp->kings[BLACK].row + 1);
+	exit(0);
+	return 0;
 }
 
 void *get_best_move_wrapper(void *position_depth_and_ptrs) {
 	PDP args = *((PDP *)position_depth_and_ptrs);
-	(*(args.ptr)).evaluation = get_best_move(args.pp, args.depth).evaluation;
+	Move best_response;
+	(*(args.ptr)).evaluation = find_best_move(args.pp, &best_response, ALPHA_REJECT, BETA_REJECT, args.depth);
 	sem_post(thread_num);
 	return NULL;
 }
 
 Move evaluate_all(Position *pp, int depth) {
 	Evaluated_Move em_array[8 * N];
+	Evaluated_Move best_responses [8 * N];
 	Position position_after_move[8 * N];
 	pthread_t tid[number_of_threads];
 	int n = get_moves(pp, em_array); // Number of moves
@@ -469,25 +495,35 @@ Move evaluate_all(Position *pp, int depth) {
 }
 
 void print_em(Evaluated_Move em) {
-	printf("Evaluation: %d\tMove: ", em.evaluation);
-	print_move(&em.move);
-}
-
-void print_moves(Evaluated_Move *array, int n) {
-	for (int i = 0; i < n; i++) {
-		printf("Evaluation: %d\tMove: ", array[i].evaluation);
-		print_move(&array[i].move);
+	int evaluation = abs(em.evaluation);
+	char flag[3] = "";
+	if (em.evaluation >= 0) flag[0] = ' ';
+	if (em.evaluation < 0) flag[0] = '-';
+	if (em.evaluation >= FORCED_WIN_WHITE) {
+		evaluation = WHITE_WINS - em.evaluation;
+		flag[1] = '#';
 	}
+	if (em.evaluation <= FORCED_WIN_BLACK) {
+		evaluation = em.evaluation - BLACK_WINS;
+		flag[1] = '#';
+	}
+	printf("Evaluation: %s%d\t", flag, evaluation);
+	char move[] = {0, 0, '-', 0, 0, 0};
+	move[0] = 'a' + em.move.start.col;
+	move[1] = '0' + N - em.move.start.row;
+	move[3] = 'a' + em.move.end.col;
+	move[4] = '0' + N - em.move.end.row;
+	printf("Move: %s\n", move);
 }
 
 int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // Returns the evaluation of White's best move from the position "*pp"
 	positions_evaluated++;
-	if (depth == 0) return evaluate_position(pp);
+	if (depth == 0) return evaluate_position(pp, THREE_CHECKS);
 	Evaluated_Move em_array[8 * N];
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of candidate moves from current position
 	int flag; // Value of finished game (White win, Black win, or draw)
-	if (game_over(pp, n, &flag)) return flag;
+	if (game_over(pp, n, &flag, THREE_CHECKS)) return flag;
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
 		make_move(pp, &position_after_move, &em_array[i].move);
 		if (i != 0 && depth > SHALLOW_SEARCH_DEPTH + 2 && shallow_reject(&position_after_move, alpha, beta, &em_array[i].evaluation)) continue;
@@ -517,6 +553,9 @@ int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // 
 	}
 	int best_index = (pp->turn == WHITE) ? find_max_index(em_array, n) : find_min_index(em_array, n);
 	*mp = em_array[best_index].move;
+	//if (em_array[best_index].evaluation > 300 || em_array[best_index].evaluation < -300) printf("Error.\n");
+	if (em_array[best_index].evaluation <= FORCED_WIN_BLACK) return em_array[best_index].evaluation + 1;
+	if (em_array[best_index].evaluation >= FORCED_WIN_WHITE) return em_array[best_index].evaluation - 1;
 	return em_array[best_index].evaluation;
 }
 
