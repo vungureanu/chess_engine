@@ -58,8 +58,14 @@ typedef struct Evaluated_Move {
 	int evaluation;
 } Evaluated_Move;
 
+typedef struct Compressed_Position {
+	uint32_t white_pieces;
+	uint32_t black_pieces;
+	uint8_t checks_and_turn;
+} Compressed_Position;
+
 typedef struct Evaluated_Position {
-	uint64_t compressed_position;
+	Compressed_Position compressed_position;
 	int evaluation;
 	int8_t depth;
 } Evaluated_Position;
@@ -87,8 +93,8 @@ int check_prime(int p, int *prime_array, int n);
 void print_position(Position *pp);
 void *get_best_move_wrapper(void *position_depth_and_ptr);
 // Analogous to "find_best_move"; serves as a suitable entry point for newly created threads.
-void add_to_hash(uint64_t compressed_position, int evaluation, int depth, int index);
-int check_hash(uint64_t compressed_position, int depth, int *index);
+void add_to_hash(Compressed_Position *compressed_position, int evaluation, int depth, int index);
+int check_hash(Compressed_Position *compressed_position, int depth, int *index);
 // Check if a position is in the hash table.  If so, return its evaluation; if not, and there is space,
 // add it to the table and set "*index" accordingly
 void print_em(Evaluated_Move em);
@@ -104,7 +110,8 @@ void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node *
 int parse_options(int argc, char **argv);
 // Allows user to set number of threads and hash table size.
 int shallow_reject(Position *pp, int alpha, int beta, int *flag);
-int evaluate_position(Position *pp, Mode mode);
+int evaluate_position(Position *pp);
+int cmp_equal(Compressed_Position *p1, Compressed_Position *p2); // Returns whether the two positions are equal
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
@@ -113,33 +120,42 @@ int hash_table_size = 99991;
 int hash_check = 0;
 int hash_hit = 0;
 int number_of_threads = 16;
+Mode mode = KINGS_CROSS;
 sem_t *thread_num;
 pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t hash_cond = PTHREAD_COND_INITIALIZER;
 
-uint64_t compress_position(Position *pp) { // Associates each position with a unique 64-bit integer
-	uint64_t cmp_white = 0, cmp_black = 0, result = 0;
+Compressed_Position compress_position(Position *pp) { // Associates each position with a unique 64-bit integer
+	uint32_t cmp_white = 0, cmp_black = 0, square = 0;
+	uint8_t checks_and_turn = 0;
 	for (int i = 0; i < pp->number_of_knights[WHITE]; i++) {
-		uint64_t square = N * pp->knights[WHITE][i].row + pp->knights[WHITE][i].col;
+		square = N * pp->knights[WHITE][i].row + pp->knights[WHITE][i].col + 1; // The +1 is there to prevent confusion between non-existent knights and knights located at (0, 0).
 		cmp_white = cmp_white | (square << (i * 6)); // 2^6 = 64
 	}
-	uint64_t square = N * pp->kings[WHITE].row + pp->kings[WHITE].col;
+	square = N * pp->kings[WHITE].row + pp->kings[WHITE].col;
 	cmp_white = cmp_white | (square << K * 6);
 	for (int i = 0; i < pp->number_of_knights[BLACK]; i++) {
-		uint64_t square = N * pp->knights[BLACK][i].row + pp->knights[BLACK][i].col;
+		square = N * pp->knights[BLACK][i].row + pp->knights[BLACK][i].col + 1;
 		cmp_black = cmp_black | (square << (i * 6));
 	}
 	square = N * pp->kings[BLACK].row + pp->kings[BLACK].col;
 	cmp_black = cmp_black | (square << (K * 6));
-	uint64_t prefix = (pp->turn) | (pp->checks[WHITE] << 1) | (pp->checks[BLACK] << 2);
-	return prefix | (cmp_white << 3) | (cmp_black << 33);
+	checks_and_turn = (pp->turn) | (pp->checks[WHITE] << 3) | (pp->checks[BLACK] << 5);
+	return (Compressed_Position){ cmp_white, cmp_black, checks_and_turn };
 }
 
-int hash(uint64_t position) {
-	return position % hash_table_size;
+int hash(Compressed_Position *compressed_position) {
+	uint32_t result = compressed_position->white_pieces % hash_table_size;
+	result *= (compressed_position->black_pieces % hash_table_size);
+	result = (result * compressed_position->checks_and_turn) % hash_table_size;
+	return (int)result;
 }
 
-int check_hash(uint64_t compressed_position, int depth, int *index) {
+int cmp_equal(Compressed_Position *p1, Compressed_Position *p2) {
+	return (p1->white_pieces == p2->white_pieces) && (p1->black_pieces == p2->black_pieces) && (p1->checks_and_turn == p2->checks_and_turn);
+}
+
+int check_hash(Compressed_Position *compressed_position, int depth, int *index) {
 	hash_check++;
 	int p_hash = hash(compressed_position);
 	int worst_index = p_hash;
@@ -153,17 +169,16 @@ int check_hash(uint64_t compressed_position, int depth, int *index) {
 				worst_depth = hash_table[index].depth;
 				worst_index = index;
 			}
-			if (hash_table[index].compressed_position == compressed_position && hash_table[index].depth >= depth) {
+			if (cmp_equal(&hash_table[index].compressed_position, compressed_position) && hash_table[index].depth >= depth) {
 				hash_hit++;
 				evaluation = hash_table[index].evaluation;
 				for (int j = 0; j <= i; j++) pthread_mutex_unlock(mutex_table + (p_hash + j) % hash_table_size);
-				if (hash_table[index].evaluation > 300 || hash_table[index].evaluation < -300) printf("Error: %d.\n", hash_table[index].evaluation);
 				return evaluation;
 			}
 		}
 	}
 	if (worst_depth != MAX_DEPTH + 1) { // Space found in hash table
-		hash_table[worst_index].compressed_position = compressed_position;
+		hash_table[worst_index].compressed_position = *compressed_position;
 		hash_table[worst_index].evaluation = IN_PROGRESS;
 		for (int i = 0; i < HASH_DEPTH; i++) pthread_mutex_unlock(mutex_table + (p_hash + i) % hash_table_size);
 		*index = worst_index;
@@ -173,9 +188,9 @@ int check_hash(uint64_t compressed_position, int depth, int *index) {
 	return HASH_FULL;
 }
 
-void add_to_hash(uint64_t compressed_position, int evaluation, int depth, int index) {
+void add_to_hash(Compressed_Position *compressed_position, int evaluation, int depth, int index) {
 	pthread_mutex_lock(mutex_table + index);
-	hash_table[index].compressed_position = compressed_position;
+	hash_table[index].compressed_position = *compressed_position;
 	hash_table[index].evaluation = evaluation;
 	hash_table[index].depth = depth;
 	pthread_mutex_unlock(mutex_table + index);
@@ -302,7 +317,7 @@ void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node *
 	*(roots + value) = nodes + n;
 }
 
-int ev(Position *pp, Coord *start, Coord *end, Move_Type move_type, Mode mode) {
+int ev(Position *pp, Coord *start, Coord *end, Move_Type move_type) {
 	if (mode == THREE_CHECKS) {
 		if (move_type == KING_MOVE) return occupied_opponent(pp, end);
 		if (move_type == KNIGHT_MOVE) return occupied_opponent(pp, end) + knight_attacks(end, &(pp->kings[1-pp->turn]));
@@ -310,16 +325,14 @@ int ev(Position *pp, Coord *start, Coord *end, Move_Type move_type, Mode mode) {
 	if (mode == KINGS_CROSS) {
 		if (move_type == KING_MOVE) {
 			int rows_forward = (pp->turn == WHITE) ? start->row - end->row : end->row - start->row;
-			return occupied_opponent(pp, end) + rows_forward;
+			return occupied_opponent(pp, end) + rows_forward + 1;
 		}
-		if (move_type == KNIGHT_MOVE) return occupied_opponent(pp, end);
+		if (move_type == KNIGHT_MOVE) return occupied_opponent(pp, end) + 1;
 	}
-	exit(0);
 	return 0;
 }
 
 int get_moves(Position *pp, Evaluated_Move *mp) {
-	Evaluated_Move *start_ptr = mp;
 	Coord move_array[8];
 	LL_Node null_node = {NULL, NULL};
 	LL_Node *roots[POSSIBLE_VALUES];
@@ -333,7 +346,7 @@ int get_moves(Position *pp, Evaluated_Move *mp) {
 			Coord *start = &(pp->knights[pp->turn][i]);
 			Coord *end = &(pp->checking_square);
 			if (knight_attacks(start, end)) {
-				int value = ev(pp, start, end, KNIGHT_MOVE, THREE_CHECKS);
+				int value = ev(pp, start, end, KNIGHT_MOVE);
 				add_move(start, end, value, tmp_array, n, roots, nodes);
 				n++;
 			}
@@ -342,10 +355,9 @@ int get_moves(Position *pp, Evaluated_Move *mp) {
 	else {
 		for (int i = 0; i < pp->number_of_knights[pp->turn]; i++) {
 			Coord *start = &(pp->knights[pp->turn][i]);
-			Coord *king = &(pp->kings[1-pp->turn]);
 			int number_of_possible_moves = get_knight_moves(pp, start, move_array);
 			for (int j = 0; j < number_of_possible_moves; j++) {
-				int value = ev(pp, start, move_array + j, KNIGHT_MOVE, THREE_CHECKS);
+				int value = ev(pp, start, move_array + j, KNIGHT_MOVE);
 				add_move(start, move_array + j, value, tmp_array, n, roots, nodes);
 				n++;
 			}
@@ -354,7 +366,7 @@ int get_moves(Position *pp, Evaluated_Move *mp) {
 	int number_of_possible_moves = get_king_moves(pp, move_array);
 	Coord *start = &(pp->kings[pp->turn]);
 	for (int j = 0; j < number_of_possible_moves; j++) {
-		int value = ev(pp, start, move_array + j, KING_MOVE, THREE_CHECKS);
+		int value = ev(pp, start, move_array + j, KING_MOVE);
 		add_move(start, move_array + j, value, tmp_array, n, roots, nodes);
 		n++;
 	}
@@ -404,7 +416,7 @@ void make_move(Position *pp_old, Position *pp_new, Move *move) {
 	}
 }
 
-int game_over(Position *pp, int available_moves, int *flag, Mode mode) {
+int game_over(Position *pp, int available_moves, int *flag) {
 	if (mode == THREE_CHECKS) {
 		if (pp->checks[WHITE] == 0) {
 			*flag = BLACK_WINS;
@@ -437,16 +449,14 @@ int game_over(Position *pp, int available_moves, int *flag, Mode mode) {
 		}
 		return 0;
 	}
-	exit(0);
 	return 0;
 }
 
-int evaluate_position(Position *pp, Mode mode) {
+int evaluate_position(Position *pp) {
 	if (mode == THREE_CHECKS) {
 		return (1 * pp->number_of_knights[0] + 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] + 1 * pp->checks[1]);
 	}
 	if (mode == KINGS_CROSS) return (pp->number_of_knights[WHITE] + (N - pp->kings[WHITE].row)) - (pp->number_of_knights[BLACK] + pp->kings[BLACK].row + 1);
-	exit(0);
 	return 0;
 }
 
@@ -460,34 +470,24 @@ void *get_best_move_wrapper(void *position_depth_and_ptrs) {
 
 Move evaluate_all(Position *pp, int depth) {
 	Evaluated_Move em_array[8 * N];
-	Evaluated_Move best_responses [8 * N];
 	Position position_after_move[8 * N];
-	pthread_t tid[number_of_threads];
 	int n = get_moves(pp, em_array); // Number of moves
+	pthread_t tid[n];
 	PDP args[n];
-	int i = 0;
-	int thread_index = 0;
 	sem_unlink("/semaphore");
 	thread_num = sem_open("/semaphore", O_CREAT | O_EXCL, S_IRWXU, number_of_threads);
 	if (thread_num == SEM_FAILED) {
 		printf("Error establishing semaphore.\n");
 		exit(1);
 	}
-	while (i < n) {
+	for (int i = 0; i < n; i++) {
 		sem_wait(thread_num);
 		make_move(pp, position_after_move + i, &em_array[i].move);
 		args[i] = (PDP){position_after_move + i, depth, em_array + i};
-		pthread_create(tid + thread_index, NULL, get_best_move_wrapper, (void *)(args + i));
-		thread_index = (thread_index + 1) % number_of_threads;
-		i++;
+		pthread_create(tid + i, NULL, get_best_move_wrapper, (void *)(args + i));
 	}
-	for (int j = 0; j < number_of_threads; j++) {
-		pthread_join(tid[j], NULL);
-	}
-	int best_index = 0;
-	for (int j = 0; j < n; j++) {
-		print_em(em_array[j]);
-	}
+	for (int i = 0; i < n; i++) pthread_join(tid[i], NULL);
+	for (int i = 0; i < n; i++) print_em(em_array[i]);
 	sem_close(thread_num);
 	sem_unlink("/semaphore");
 	int index = pp->turn == WHITE ? find_max_index(em_array, n) : find_min_index(em_array, n);
@@ -518,22 +518,22 @@ void print_em(Evaluated_Move em) {
 
 int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // Returns the evaluation of White's best move from the position "*pp"
 	positions_evaluated++;
-	if (depth == 0) return evaluate_position(pp, THREE_CHECKS);
+	if (depth == 0) return evaluate_position(pp);
 	Evaluated_Move em_array[8 * N];
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of candidate moves from current position
 	int flag; // Value of finished game (White win, Black win, or draw)
-	if (game_over(pp, n, &flag, THREE_CHECKS)) return flag;
+	if (game_over(pp, n, &flag)) return flag;
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
 		make_move(pp, &position_after_move, &em_array[i].move);
 		if (i != 0 && depth > SHALLOW_SEARCH_DEPTH + 2 && shallow_reject(&position_after_move, alpha, beta, &em_array[i].evaluation)) continue;
-		uint64_t compressed_position = compress_position(&position_after_move);
+		Compressed_Position compressed_position = compress_position(&position_after_move);
 		int hash_index;
-		int evaluation = check_hash(compressed_position, depth, &hash_index);
+		int evaluation = check_hash(&compressed_position, depth, &hash_index);
 		if (evaluation == NOT_IN_HASH) {
 			em_array[i].evaluation = find_best_move(&position_after_move, mp, alpha, beta, depth - 1);
 			if (em_array[i].evaluation != ALPHA_REJECT && em_array[i].evaluation != BETA_REJECT) {
-				add_to_hash(compressed_position, em_array[i].evaluation, depth, hash_index);
+				add_to_hash(&compressed_position, em_array[i].evaluation, depth, hash_index);
 			}
 		}
 		else if (evaluation == HASH_FULL || evaluation == IN_PROGRESS) { // Proceed with evaluation, but do not add to hash
@@ -553,7 +553,6 @@ int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // 
 	}
 	int best_index = (pp->turn == WHITE) ? find_max_index(em_array, n) : find_min_index(em_array, n);
 	*mp = em_array[best_index].move;
-	//if (em_array[best_index].evaluation > 300 || em_array[best_index].evaluation < -300) printf("Error.\n");
 	if (em_array[best_index].evaluation <= FORCED_WIN_BLACK) return em_array[best_index].evaluation + 1;
 	if (em_array[best_index].evaluation >= FORCED_WIN_WHITE) return em_array[best_index].evaluation - 1;
 	return em_array[best_index].evaluation;
@@ -635,18 +634,18 @@ void sig_exit(int sig_num) {
 Position p;
 
 void set_test(void) {
-	p.knights[0][0] = (Coord){2, 3};
+	p.knights[0][0] = (Coord){5, 2};
 	p.knights[0][1] = (Coord){3, 2};
-	p.knights[0][2] = (Coord){3, 4};
-	p.knights[0][3] = (Coord){3, 5};
-	p.knights[1][0] = (Coord){2, 0};
-	p.knights[1][1] = (Coord){0, 1};
-	p.knights[1][2] = (Coord){2, 1};
-	p.knights[1][3] = (Coord){0, 3};
+	p.knights[0][2] = (Coord){3, 5};
+	p.knights[0][3] = (Coord){3, 4};
+	p.knights[1][0] = (Coord){0, 3};
+	p.knights[1][1] = (Coord){0, 2};
+	p.knights[1][2] = (Coord){2, 2};
+	p.knights[1][3] = (Coord){2, 1};
 	p.kings[0] = (Coord){5, 0};
 	p.kings[1] = (Coord){0, 5};
-	p.checks[0] = 0;
-	p.checks[1] = 0;
+	p.checks[0] = 3;
+	p.checks[1] = 3;
 	p.number_of_knights[0] = 4;
 	p.number_of_knights[1] = 4;
 	p.turn = BLACK;
@@ -656,9 +655,9 @@ void set_test(void) {
 
 int parse_options(int argc, char **argv) {
 	int option;
+	long arg;
 	while ((option = getopt(argc, argv, "h:t:")) != -1) {
 		switch (option) {
-			long arg;
 			case 'h':
 				arg = strtol(optarg, NULL, 10);
 				if (arg == 0 || arg > 1000000) printf("Invalid argument given to \"-h\".  Please enter an integer between 1 and 1000000.\n");
@@ -684,7 +683,6 @@ int main(int argc, char **argv) {
 	Position position;
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
-	Evaluated_Move moves[40];
 	Position new_p;
 	while (1) {
 		print_position(&position);
@@ -695,7 +693,7 @@ int main(int argc, char **argv) {
 		position = new_p;
 		print_position(&position);
 		time(&t1);
-		Move cmp_response = evaluate_all(&position, 10);
+		Move cmp_response = evaluate_all(&position, 8);
 		make_move(&position, &new_p, &cmp_response);
 		//position = new_p;
 		time(&t2);
@@ -706,7 +704,6 @@ int main(int argc, char **argv) {
 		hash_hit = 0;
 		hash_check = 0;
 		memset(hash_table, 0, sizeof(Evaluated_Position) * hash_table_size);
-		Evaluated_Move cr;
 		position = new_p;
 	}
 	return 0;
