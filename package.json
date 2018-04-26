@@ -1,0 +1,9 @@
+{
+  "name": "chess-variants",
+  "version": "0.0.1",
+  "description": "provides a GUI and server for playing two chess variants against an engine",
+  "dependencies": {
+    "express": "^4.16.3",
+    "socket.io": "^2.1.0"
+  }
+}

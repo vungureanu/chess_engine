@@ -84,34 +84,55 @@ typedef struct LL_Node {
 typedef enum Mode {THREE_CHECKS, KINGS_CROSS} Mode;
 typedef enum Move_Type {KING_MOVE, KNIGHT_MOVE} Move_Type;
 
-int get_moves(Position *pp, Evaluated_Move *mp);
-// Adds moves to "mp" in decreasing order of expected value and returns number of moves added.
-void make_move(Position *pp_old, Position *pp_new, Move *move);
+int get_moves(Position *pp, Evaluated_Move *mp); // Adds moves to "mp" in decreasing order of expected value and returns number of moves added.
+void make_move(Position *pp_old, Position *pp_new, Move *move); // Stores position which results from making given move in old position
+
 int get_prime(int n);
 int check_prime(int p, int *prime_array, int n);
-// These two functions are used to create a hash table of prime length to ensure more uniform distribution of hashes.
+// Used in creating a hash table of prime length to ensure more uniform distribution of hashes.
+
 void print_position(Position *pp);
+void print_em(Evaluated_Move em);
+
+int shallow_reject(Position *pp, int alpha, int beta, int *flag);
+// Evaluates a move at a shallow depth to determine whether it's worth exploring more thoroughly
+int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth);
 void *get_best_move_wrapper(void *position_depth_and_ptr);
-// Analogous to "find_best_move"; serves as a suitable entry point for newly created threads.
+// Examines position up to given depth and stores best move it finds in "mp".  Uses probabilistic cutting to
+// reduce search space, and so may produce sub-optimal moves.  Its wrapper serves as a suitable entry point
+// for newly created threads.
+
+int cmp_equal(Compressed_Position *p1, Compressed_Position *p2); // Determines whether the two positions are equal
 void add_to_hash(Compressed_Position *compressed_position, int evaluation, int depth, int index);
 int check_hash(Compressed_Position *compressed_position, int depth, int *index);
 // Check if a position is in the hash table.  If so, return its evaluation; if not, and there is space,
-// add it to the table and set "*index" accordingly
-void print_em(Evaluated_Move em);
-int occupied_opponent(Position *pp, Coord *coord);
+// add it to the table and set "*index" accordingly.
+
 int find_max_index(Evaluated_Move array[], int length);
-int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth);
+int find_min_index(Evaluated_Move array[], int length);
+// Return best moves from array (i.e., moves with greatest evaluation for White and smallest evaluation for Black)
+
 void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node **roots, LL_Node *nodes);
 // Adds move described by "start" and "end", with expected value "value", to array "array".
 // Adds node to array "nodes" which points to move and to the previous node located at "roots[value]" (if any).
 // Node at "roots[value]" changed to point to added node.  "roots" contains the at most "POSSIBLE_VALUES" nodes,
 // the ith of which points to the first node in a linked list containing nodes pointing to moves with an
 // expected value of i.
-int parse_options(int argc, char **argv);
-// Allows user to set number of threads and hash table size.
-int shallow_reject(Position *pp, int alpha, int beta, int *flag);
-int evaluate_position(Position *pp);
-int cmp_equal(Compressed_Position *p1, Compressed_Position *p2); // Returns whether the two positions are equal
+
+int parse_options(int argc, char **argv); // Allows user to set number of threads and hash table size.
+
+int evaluate_position(Position *pp); // Gives rudimentary (depth-0) evaluation of position
+
+int knight_attacks(Coord *knight_position, Coord *coord);
+int king_attacks(Coord *king_position, Coord *coord);
+int is_protected(Position *pp, Coord *coord);
+int occupied_opponent(Position *pp, Coord *coord);
+// Helper functions to determine legal moves
+
+void set_pieces(uint32_t pieces, Position *pp, int color);
+Position decompress_position(Compressed_Position *cmp);
+Compressed_Position compress_position(Position *pp);
+// Allow for the compression (for use in hash table) and decompression (for all other uses) of "Position" structures
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
@@ -119,8 +140,10 @@ pthread_mutex_t *mutex_table;
 int hash_table_size = 99991;
 int hash_check = 0;
 int hash_hit = 0;
-int number_of_threads = 16;
-Mode mode = KINGS_CROSS;
+int number_of_threads = 8;
+int start_depth = 9;
+Mode mode = THREE_CHECKS;
+int verbose = 0;
 sem_t *thread_num;
 pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t hash_cond = PTHREAD_COND_INITIALIZER;
@@ -140,8 +163,41 @@ Compressed_Position compress_position(Position *pp) { // Associates each positio
 	}
 	square = N * pp->kings[BLACK].row + pp->kings[BLACK].col;
 	cmp_black = cmp_black | (square << (K * 6));
-	checks_and_turn = (pp->turn) | (pp->checks[WHITE] << 3) | (pp->checks[BLACK] << 5);
-	return (Compressed_Position){ cmp_white, cmp_black, checks_and_turn };
+	checks_and_turn = (pp->turn) | (pp->checks[WHITE] << 1) | (pp->checks[BLACK] << 3);
+	return (Compressed_Position){cmp_white, cmp_black, checks_and_turn};
+}
+
+Position decompress_position(Compressed_Position *cmp) {
+	Position position;
+	set_pieces(cmp->white_pieces, &position, WHITE);
+	set_pieces(cmp->black_pieces, &position, BLACK);
+	position.turn = cmp->checks_and_turn % 2;
+	uint8_t mask = 3;
+	position.checks[WHITE] = (cmp->checks_and_turn & (mask << 1)) >> 1;
+	position.checks[BLACK] = (cmp->checks_and_turn & (mask << 3)) >> 3;
+	for (int i = 0; i < position.number_of_knights[1 - position.turn]; i++) {
+		if (knight_attacks(&position.knights[1 - position.turn][i], &position.kings[position.turn])) {
+			position.in_check = 1;
+			position.checking_square = position.knights[1 - position.turn][i];
+		}
+	}
+	return position;
+}
+
+void set_pieces(uint32_t pieces, Position *pp, int color) {
+	uint32_t mask = 63; // 2^6 - 1
+	uint32_t knight_position = pieces & mask;
+	int i = 0;
+	while (knight_position != 0 && i < K) {
+		int row = (int)(knight_position - 1) / N;
+		int col = (int)(knight_position - 1) % N;
+		pp->knights[color][i] = (Coord){row, col};
+		i++;
+		knight_position = (pieces & (mask << (i * 6))) >> (i * 6);
+	}
+	pp->number_of_knights[color] = i;
+	uint32_t king_position = (pieces & (mask << (K * 6))) >> (K * 6);
+	pp->kings[color] = (Coord){(int)king_position / N, (int)king_position % N};
 }
 
 int hash(Compressed_Position *compressed_position) {
@@ -221,6 +277,9 @@ int find_min_index(Evaluated_Move array[], int length) { // Length must be great
 }
 
 void print_position(Position *pp) {
+	Compressed_Position compressed_position = compress_position(pp);
+	printf("Compressed position: %d %d %d\n", compressed_position.white_pieces, compressed_position.black_pieces, compressed_position.checks_and_turn);
+	if (!verbose) return;
 	int board[N][N];
 	memset(board, 0, sizeof(board));
 	board[pp->kings[0].row][pp->kings[0].col] = 9812;
@@ -487,7 +546,9 @@ Move evaluate_all(Position *pp, int depth) {
 		pthread_create(tid + i, NULL, get_best_move_wrapper, (void *)(args + i));
 	}
 	for (int i = 0; i < n; i++) pthread_join(tid[i], NULL);
-	for (int i = 0; i < n; i++) print_em(em_array[i]);
+	if (verbose) {
+		for (int i = 0; i < n; i++) print_em(em_array[i]);
+	}
 	sem_close(thread_num);
 	sem_unlink("/semaphore");
 	int index = pp->turn == WHITE ? find_max_index(em_array, n) : find_min_index(em_array, n);
@@ -598,6 +659,7 @@ Move get_user_move(void) {
 	char buf[20] = {'\0'};
 	read(fileno(stdin), buf, 20);
 	int c1, r1, c2, r2;
+	if (!verbose) return (Move){buf[0] - '0', buf[1] - '0', buf[2] - '0', buf[3] - '0'};
 	c1 = buf[0] - 'a';
 	r1 = buf[1] - '0';
 	c2 = buf[2] - 'a';
@@ -631,42 +693,31 @@ void sig_exit(int sig_num) {
 	exit(0);
 }
 
-Position p;
-
-void set_test(void) {
-	p.knights[0][0] = (Coord){5, 2};
-	p.knights[0][1] = (Coord){3, 2};
-	p.knights[0][2] = (Coord){3, 5};
-	p.knights[0][3] = (Coord){3, 4};
-	p.knights[1][0] = (Coord){0, 3};
-	p.knights[1][1] = (Coord){0, 2};
-	p.knights[1][2] = (Coord){2, 2};
-	p.knights[1][3] = (Coord){2, 1};
-	p.kings[0] = (Coord){5, 0};
-	p.kings[1] = (Coord){0, 5};
-	p.checks[0] = 3;
-	p.checks[1] = 3;
-	p.number_of_knights[0] = 4;
-	p.number_of_knights[1] = 4;
-	p.turn = BLACK;
-	p.in_check = 0;
-	p.checking_square = (Coord){0, 0};
-}
-
 int parse_options(int argc, char **argv) {
 	int option;
 	long arg;
-	while ((option = getopt(argc, argv, "h:t:")) != -1) {
+	while ((option = getopt(argc, argv, "h:t:d:v")) != -1) {
 		switch (option) {
 			case 'h':
 				arg = strtol(optarg, NULL, 10);
-				if (arg == 0 || arg > 1000000) printf("Invalid argument given to \"-h\".  Please enter an integer between 1 and 1000000.\n");
-				else hash_table_size = (int)arg;
+				if (arg <= 0 || arg > 1000000) printf("Invalid argument given to \"-h\".  Please enter an integer between 1 and 1000000.\n");
+				else hash_table_size = get_prime((int)arg);
 				break;
 			case 't':
 				arg = strtol(optarg, NULL, 10);
-				if (arg == 0 || arg > 64) printf("Invalid argument given to \"-t\".  Please enter an integer between 1 and 64.\n");
+				if (arg <= 0 || arg > 64) printf("Invalid argument given to \"-t\".  Please enter an integer between 1 and 64.\n");
 				else number_of_threads = (int)arg;
+				break;
+			case 'd':
+				arg = strtol(optarg, NULL, 10);
+				if (arg <= 0 || arg > 12) printf("Invalid argument given to \"-d\".  Please enter an integer between 1 and 12.\n");
+				else start_depth = (int)arg;
+				break;
+			case 'v':
+				verbose = 1;
+				break;
+			default:
+				printf("Invalid argument.  Available options are -d, -h, -t, -v.\n");
 				break;
 		}
 	}
@@ -685,20 +736,29 @@ int main(int argc, char **argv) {
 	get_starting_position(&position);
 	Position new_p;
 	while (1) {
-		print_position(&position);
-		printf("Move: \n");
+		if (verbose) {
+			print_position(&position);
+			printf("Move: \n");
+			fflush(stdout);
+		}
 		Move move = get_user_move();
 		make_move(&position, &new_p, &move);
-		time_t t1, t2;
 		position = new_p;
-		print_position(&position);
+		time_t t1, t2;
+		if (verbose) print_position(&position);
 		time(&t1);
-		Move cmp_response = evaluate_all(&position, 8);
+		Move cmp_response = evaluate_all(&position, start_depth);
 		make_move(&position, &new_p, &cmp_response);
+		if (!verbose) {
+			printf("%c%c%c%c", '0' + cmp_response.start.row, '0' + cmp_response.start.col, '0' + cmp_response.end.row, '0' + cmp_response.end.col);
+			fflush(stdout);
+		}
 		//position = new_p;
 		time(&t2);
-		printf("Time: %f\n", difftime(t2, t1));
-		printf("%d/%d.  Evaluated: %d\n. %d/%d\n", hash_hit, hash_check, positions_evaluated, sr, sc);
+		if (verbose) {
+			printf("Time: %f. Hash hits: %d/%d.  Evaluated positions: %d\n.", difftime(t2, t1), hash_hit, hash_check, positions_evaluated);
+			fflush(stdout);
+		}
 		sr = 0;
 		sc = 0;
 		hash_hit = 0;
