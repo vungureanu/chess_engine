@@ -4,33 +4,98 @@ var board_context;
 var board_canvas;
 var pieces_canvas;
 var pieces_context;
-var board_length = 300;
+var board_length;
 var square_length;
 var board = [];
 var socket = io();
+const table_padding = 15;
 const offset = 1.5;
 var highlighted_squares = [null, null];
 var pieces_loaded_event = new Event("pieces loaded");
+var table = document.getElementById("game_info");
+var white_checks = document.getElementById("white_checks");
+var black_checks = document.getElementById("black_checks");
+var new_three_checks = document.getElementById("new_three_checks");
+var new_kings_cross = document.getElementById("new_kings_cross");
+white_checks.checks = 0;
+black_checks.checks = 0;
+new_three_checks.addEventListener("click", function() {
+	socket.emit("new_game", "three_checks");
+	reset_pieces();
+});
+new_kings_cross.addEventListener("click", function() {
+	socket.emit("new_game", "kings_cross");
+	reset_pieces();
+});
+
+function set_board_length(length) {
+	board_length = length - (length % N);
+	square_length = length / N;
+	console.log(board_length);
+}
+set_board_length(500);
+
 addEventListener("pieces loaded", function() {
-	set_element("board_container", 300, 6);
+	set_element("board_container", board_length, 6);
 	initialize_board(6);
+	reset_pieces();
+	initialize_table();
 });
 
 socket.on("response", function(response_str) {
 	var response = JSON.parse(response_str);
+	console.log(response);
 	move(response.start, response.end);
 });
+
+socket.on("legal", function() {
+	console.log("Legal");
+	clear_highlight(pending_move.start);
+	clear_highlight(pending_move.end);
+	move(pending_move.start, pending_move.end);
+	pending_move = null;
+});
+
+socket.on("illegal", function() {
+	clear_highlight(pending_move.start);
+	clear_highlight(pending_move.end);
+	pending_move = null;
+	console.log("Illegal");
+});
+
+socket.on("result", function(result) {
+	for (var square of highlighted_squares) {
+		clear_highlight(square);
+	}
+	console.log(result);
+});
+
+socket.on("check", function(side) {
+	console.log("OK");
+	if (side == 0) {
+		white_checks.checks++;
+		white_checks.innerHTML = "White: " + white_checks.checks;
+	}
+	else {
+		black_checks.checks++;
+		black_checks.innerHTML = "Black: " + black_checks.checks;
+	}
+});
+
+var pending_move;
 
 function set_element(container_id, size, n) {
 	var container = document.getElementById(container_id);
 	container.style.position = "absolute";
 	container.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
+	container.style.top = Math.floor(window.innerHeight / 2 - board_length / 2) + "px";
 	board_canvas = document.createElement("canvas");
 	board_canvas.style.position = "absolute";
 	board_canvas.style.left = "0px";
 	board_canvas.style.top = "0px";
 	board_canvas.width = size;
 	board_canvas.height = size;
+	//board_canvas.style.border = "5px solid";
 	board_context = board_canvas.getContext("2d");
 	container.appendChild(board_canvas);
 	pieces_canvas = document.createElement("canvas");
@@ -47,41 +112,66 @@ function set_element(container_id, size, n) {
 	pieces_canvas.onmousedown = function(e) {
 		var col = Math.floor((e.pageX - container.offsetLeft) / square_length);
 		var row = Math.floor((e.pageY - container.offsetTop) / square_length);
+		if (pending_move != null) return;
 		if (highlighted_squares[0] == null) {
 			highlighted_squares[0] = { row: row, col: col };
 			pieces_context.strokeRect(col * square_length + offset, row * square_length + offset, square_length - 2 * offset, square_length - 2 * offset);
 		}
 		else if (highlighted_squares[0].row == row && highlighted_squares[0].col == col) {
+			clear_highlight(highlighted_squares[0]);
 			highlighted_squares[0] = null;
-			pieces_context.clearRect(col * square_length, row * square_length, square_length, square_length);
-			add_piece(board[row][col], row, col);
 		}
 		else if (highlighted_squares[1] == null) {
 			highlighted_squares[1] = { row: row, col: col };
 			pieces_context.strokeRect(col * square_length + offset, row * square_length + offset, square_length - 2 * offset, square_length - 2 * offset);
-			move(highlighted_squares[0], highlighted_squares[1]);
-			socket.emit("move", JSON.stringify({start: highlighted_squares[0], end: highlighted_squares[1]}));
+			pending_move = {start: Object.assign({}, highlighted_squares[0]), end: Object.assign({}, highlighted_squares[1])};
+			socket.emit("move", JSON.stringify(pending_move));
+			console.log("Pending:", pending_move);
 			highlighted_squares = [null, null];
 		}
 	}
 }
 
+function clear_highlight(square) {
+	if (square == null) return;
+	pieces_context.clearRect(square.col * square_length, square.row * square_length, square_length, square_length);
+	if (board[square.row][square.col] != "empty") {
+		add_piece(board[square.row][square.col], square.row, square.col);
+	}
+}
+
 function initialize_board(n) {
-	square_length = Math.floor(board_length / n);
 	for (var i = 0; i < n; i++) {
 		board.push([]);
 		for (var j = 0; j < n; j++) {
-			board[board.length-1].push([]);
+			board[board.length-1].push("empty");
 			board_context.fillStyle = ((i + j) % 2 == 0) ? 'rgb(216, 163, 119)' : 'rgb(158, 108, 67)';
 			board_context.fillRect(i * square_length, j * square_length, square_length, square_length);
 		}
 	}
-	for (var i = 0; i < n-2; i++) {
-		add_piece("black_knight", 0, i);
-		add_piece("white_knight", n-1, n-i-1);
+}
+
+function reset_pieces() {
+	for (var i = 0; i < N; i++) {
+		for (var j = 0; j < N; j++) {
+			board[i][j] = "empty";
+			clear_highlight({row: i, col: j});
+		}
 	}
-	add_piece("black_king", 0, n-1);
-	add_piece("white_king", n-1, 0);
+	for (var i = 0; i < N-2; i++) {
+		add_piece("black_knight", 0, i);
+		add_piece("white_knight", N-1, N-i-1);
+	}
+	add_piece("black_king", 0, N-1);
+	add_piece("white_king", N-1, 0);
+}
+
+function initialize_table() {
+	table.style.position = "absolute";
+	table.style.width = board_length + "px";
+	table.style.overflow = "scroll";
+	table.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
+	table.style.top = Math.floor(window.innerHeight / 2 + board_length / 2) + table_padding + "px";
 }
 
 function add_piece(piece_name, row, col) {
@@ -94,7 +184,7 @@ function move(start, end) {
 	pieces_context.clearRect(end.col * square_length, end.row * square_length, square_length, square_length);
 	board[end.row][end.col] = board[start.row][start.col];
 	pieces_context.drawImage(pieces.get(board[start.row][start.col]), end.col * square_length, end.row * square_length, square_length, square_length);
-	board[start.row][start.col] = "";
+	board[start.row][start.col] = "empty";
 }
 
 

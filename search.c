@@ -22,11 +22,12 @@
 #define BETA_REJECT 121
 #define MAX_DEPTH 100
 #define HASH_FULL 202
-#define STALEMATE 0
+#define DRAW 0
 #define CAPTURE 1
 #define CHECK 1
 #define POSSIBLE_VALUES 4 // The number of possible values a move can have; used to determine the order in which moves are evaluated
-#define SHALLOW_SEARCH_DEPTH 5
+#define SHALLOW_SEARCH_DEPTH 5 // Depth of a shallow search
+#define SHALLOW_EXECUTION_DEPTH 8 // Least depth at which a shallow search is executed
 #define FORCED_WIN_BLACK -101
 #define FORCED_WIN_WHITE 101
 #define BLACK_WINS -120
@@ -94,7 +95,7 @@ int check_prime(int p, int *prime_array, int n);
 void print_position(Position *pp);
 void print_em(Evaluated_Move em);
 
-int shallow_reject(Position *pp, int alpha, int beta, int *flag);
+int shallow_reject(Position *pp, int alpha, int beta, int *flag, int *shallow_best);
 // Evaluates a move at a shallow depth to determine whether it's worth exploring more thoroughly
 int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth);
 void *get_best_move_wrapper(void *position_depth_and_ptr);
@@ -102,7 +103,8 @@ void *get_best_move_wrapper(void *position_depth_and_ptr);
 // reduce search space, and so may produce sub-optimal moves.  Its wrapper serves as a suitable entry point
 // for newly created threads.
 
-int cmp_equal(Compressed_Position *p1, Compressed_Position *p2); // Determines whether the two positions are equal
+int equal_cmp(Compressed_Position *p1, Compressed_Position *p2); // Determines whether the two positions are equal
+int equal_crd(Coord *c1, Coord *c2); // Determines whether two coordinates are equal
 void add_to_hash(Compressed_Position *compressed_position, int evaluation, int depth, int index);
 int check_hash(Compressed_Position *compressed_position, int depth, int *index);
 // Check if a position is in the hash table.  If so, return its evaluation; if not, and there is space,
@@ -122,6 +124,8 @@ void add_move(Coord *start, Coord *end, int value, Move *array, int n, LL_Node *
 int parse_options(int argc, char **argv); // Allows user to set number of threads and hash table size.
 
 int evaluate_position(Position *pp); // Gives rudimentary (depth-0) evaluation of position
+int ev(Position *pp, Coord *start, Coord *end, Move_Type move_type);
+// Returns an integer representing the promise of a candidate move (the greater the integer, the more promising the move)
 
 int knight_attacks(Coord *knight_position, Coord *coord);
 int king_attacks(Coord *king_position, Coord *coord);
@@ -133,6 +137,10 @@ void set_pieces(uint32_t pieces, Position *pp, int color);
 Position decompress_position(Compressed_Position *cmp);
 Compressed_Position compress_position(Position *pp);
 // Allow for the compression (for use in hash table) and decompression (for all other uses) of "Position" structures
+
+int game_over(Position *pp, int available_moves, int *flag);
+void check_if_game_over(Position *pp);
+// Determine whether the game has finished in a win for either side, or in a draw
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
@@ -207,7 +215,7 @@ int hash(Compressed_Position *compressed_position) {
 	return (int)result;
 }
 
-int cmp_equal(Compressed_Position *p1, Compressed_Position *p2) {
+int equal_cmp(Compressed_Position *p1, Compressed_Position *p2) {
 	return (p1->white_pieces == p2->white_pieces) && (p1->black_pieces == p2->black_pieces) && (p1->checks_and_turn == p2->checks_and_turn);
 }
 
@@ -225,7 +233,7 @@ int check_hash(Compressed_Position *compressed_position, int depth, int *index) 
 				worst_depth = hash_table[index].depth;
 				worst_index = index;
 			}
-			if (cmp_equal(&hash_table[index].compressed_position, compressed_position) && hash_table[index].depth >= depth) {
+			if (equal_cmp(&hash_table[index].compressed_position, compressed_position) && hash_table[index].depth >= depth) {
 				hash_hit++;
 				evaluation = hash_table[index].evaluation;
 				for (int j = 0; j <= i; j++) pthread_mutex_unlock(mutex_table + (p_hash + j) % hash_table_size);
@@ -490,7 +498,11 @@ int game_over(Position *pp, int available_moves, int *flag) {
 				if (pp->turn == WHITE) *flag = BLACK_WINS;
 				else *flag = WHITE_WINS;
 			}
-			else *flag = STALEMATE;
+			else *flag = DRAW;
+			return 1;
+		}
+		if (pp->number_of_knights[WHITE] == 0 && pp->number_of_knights[BLACK] == 0) {
+			*flag = DRAW;
 			return 1;
 		}
 		return 0;
@@ -503,7 +515,7 @@ int game_over(Position *pp, int available_moves, int *flag) {
 				if (pp->turn == WHITE) *flag = BLACK_WINS;
 				else *flag = WHITE_WINS;
 			}
-			else *flag = STALEMATE;
+			else *flag = DRAW;
 			return 1;
 		}
 		return 0;
@@ -513,9 +525,9 @@ int game_over(Position *pp, int available_moves, int *flag) {
 
 int evaluate_position(Position *pp) {
 	if (mode == THREE_CHECKS) {
-		return (1 * pp->number_of_knights[0] + 1 * pp->checks[0]) - (1 * pp->number_of_knights[1] + 1 * pp->checks[1]);
+		return (2 * pp->number_of_knights[0] + pp->checks[0]) - (2 * pp->number_of_knights[1] + pp->checks[1]);
 	}
-	if (mode == KINGS_CROSS) return (pp->number_of_knights[WHITE] + (N - pp->kings[WHITE].row)) - (pp->number_of_knights[BLACK] + pp->kings[BLACK].row + 1);
+	if (mode == KINGS_CROSS) return (2 * pp->number_of_knights[WHITE] + (N - pp->kings[WHITE].row)) - (2 * pp->number_of_knights[BLACK] + pp->kings[BLACK].row + 1);
 	return 0;
 }
 
@@ -584,10 +596,14 @@ int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // 
 	Position position_after_move;
 	int n = get_moves(pp, em_array); // Number of candidate moves from current position
 	int flag; // Value of finished game (White win, Black win, or draw)
+	int shallow_best = (pp->turn == WHITE) ? ALPHA_REJECT : BETA_REJECT; // Best evaluation, at shallow depth, for a candidate move
 	if (game_over(pp, n, &flag)) return flag;
 	for (int i = 0; i < n; i++) { // Evaluate each possible move
 		make_move(pp, &position_after_move, &em_array[i].move);
-		if (i != 0 && depth > SHALLOW_SEARCH_DEPTH + 2 && shallow_reject(&position_after_move, alpha, beta, &em_array[i].evaluation)) continue;
+		if (depth >= SHALLOW_EXECUTION_DEPTH) {
+			if (i == 0) shallow_reject(&position_after_move, ALPHA_REJECT, BETA_REJECT, &em_array[i].evaluation, &shallow_best);
+			else if (shallow_reject(&position_after_move, alpha, beta, &em_array[i].evaluation, &shallow_best)) continue;
+		}
 		Compressed_Position compressed_position = compress_position(&position_after_move);
 		int hash_index;
 		int evaluation = check_hash(&compressed_position, depth, &hash_index);
@@ -619,21 +635,24 @@ int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // 
 	return em_array[best_index].evaluation;
 }
 
-int sc, sr;
-
-int shallow_reject(Position *pp, int alpha, int beta, int *flag) {
+int shallow_reject(Position *pp, int alpha, int beta, int *flag, int *shallow_best) {
+	// We reject the position from the perspective of the side which has just moved (i.e., not from the perspective of pp->turn)
 	Move best_move;
-	sc++;
 	int evaluation = find_best_move(pp, &best_move, ALPHA_REJECT, BETA_REJECT, SHALLOW_SEARCH_DEPTH);
-	if (pp->turn == BLACK && evaluation < alpha) {
-		*flag = ALPHA_REJECT;
-		return 1;
+	if (pp->turn == BLACK) {
+		if (evaluation < alpha && evaluation <= *shallow_best) {
+			*flag = ALPHA_REJECT;
+			return 1;
+		}
+		if (evaluation > *shallow_best) *shallow_best = evaluation;
 	}
-	if (pp->turn == WHITE && evaluation > beta) {
-		*flag = BETA_REJECT;
-		return 1;
+	if (pp->turn == WHITE) {
+		if (evaluation > beta && evaluation >= *shallow_best) {
+			*flag = BETA_REJECT;
+			return 1;
+		}
+		if (evaluation < *shallow_best) *shallow_best = evaluation;
 	}
-	sr++;
 	return 0;
 }
 
@@ -655,17 +674,79 @@ void get_starting_position(Position *pp) {
 	pp->checking_square = (Coord){0, 0};
 }
 
-Move get_user_move(void) {
+int equal_crd(Coord *c1, Coord *c2) {
+	return c1->row == c2->row && c1->col == c2->col;
+}
+
+Move get_user_move(Position *pp) {
 	char buf[20] = {'\0'};
-	read(fileno(stdin), buf, 20);
 	int c1, r1, c2, r2;
-	if (!verbose) return (Move){buf[0] - '0', buf[1] - '0', buf[2] - '0', buf[3] - '0'};
-	c1 = buf[0] - 'a';
-	r1 = buf[1] - '0';
-	c2 = buf[2] - 'a';
-	r2 = buf[3] - '0';
-	Move move = {{N - r1, c1}, {N - r2, c2}};
-	return move;
+	Move user_move;
+	while (1) {
+		loop: // This label is useful for breaking out of the inner "for" loop; a simple "continue" statement will not suffice
+		if (verbose) printf("Enter move: \n");
+		read(fileno(stdin), buf, 20);
+		if (!verbose) {
+			user_move = (Move){ (Coord){buf[0] - '0', buf[1] - '0'}, (Coord){buf[2] - '0', buf[3] - '0'} };
+		}
+		else {
+			c1 = buf[0] - 'a';
+			r1 = buf[1] - '0';
+			c2 = buf[2] - 'a';
+			r2 = buf[3] - '0';
+			user_move = (Move){ (Coord){N-r1, c1}, (Coord){N-r2, c2} };
+		}
+		if (user_move.start.row < 0 || user_move.start.row >= N || user_move.start.col < 0 || user_move.start.col >= N) {
+			printf("Illegal move (invalid starting square)\n");
+			fflush(stdout);
+			goto loop;
+		}
+		if (user_move.end.row < 0 || user_move.end.row >= N || user_move.end.col < 0 || user_move.end.col >= N) {
+			printf("Illegal move (invalid ending square)\n");
+			fflush(stdout);
+			goto loop;
+		}
+		for (int i = 0; i < pp->number_of_knights[pp->turn]; i++) {
+			Coord knight_coord = pp->knights[pp->turn][i];
+			if (equal_crd(&knight_coord, &user_move.start)) {
+				if (!knight_attacks(&knight_coord, &user_move.end)) {
+					printf("Illegal move (knights don't move that way)\n");
+					fflush(stdout);
+					goto loop;
+				}
+				if (!pp->in_check || equal_crd(&pp->checking_square, &user_move.end)) {
+					printf("Legal move\n");
+					fflush(stdout);
+					return user_move;
+				}
+				else {
+					printf("Illegal move (you are in check)\n");
+					fflush(stdout);
+					goto loop;
+				}
+			}
+		}
+		Coord king_coord = pp->kings[pp->turn];
+		if (equal_crd(&king_coord, &user_move.start)) {
+			if (!king_attacks(&king_coord, &user_move.end)) {
+				printf("Illegal move (kings don't move that way)\n");
+				fflush(stdout);
+				goto loop;
+			}
+			if (!is_protected(pp, &user_move.end)) {
+				printf("Legal move\n");
+				fflush(stdout);
+				return user_move;
+			}
+			else {
+				printf("Illegal move (cannot move into check)\n");
+				fflush(stdout);
+				goto loop;
+			}
+		}
+		printf("Illegal move (you must move one of your own pieces)\n");
+		fflush(stdout);
+	}
 }
 
 int get_prime(int n) {
@@ -696,7 +777,7 @@ void sig_exit(int sig_num) {
 int parse_options(int argc, char **argv) {
 	int option;
 	long arg;
-	while ((option = getopt(argc, argv, "h:t:d:v")) != -1) {
+	while ((option = getopt(argc, argv, "h:t:d:m:v")) != -1) {
 		switch (option) {
 			case 'h':
 				arg = strtol(optarg, NULL, 10);
@@ -713,6 +794,9 @@ int parse_options(int argc, char **argv) {
 				if (arg <= 0 || arg > 12) printf("Invalid argument given to \"-d\".  Please enter an integer between 1 and 12.\n");
 				else start_depth = (int)arg;
 				break;
+			case 'm':
+				mode = KINGS_CROSS;
+				break;
 			case 'v':
 				verbose = 1;
 				break;
@@ -724,47 +808,65 @@ int parse_options(int argc, char **argv) {
 	return 0;
 }
 
+void check_if_game_over(Position *pp) {
+	int flag;
+	Evaluated_Move em_array[(K+1) * 8];
+	if (game_over(pp, get_moves(pp, em_array), &flag)) {
+		switch (flag) {
+			case WHITE_WINS:
+				printf("Result: White wins\n");
+				sig_exit(0);
+				break;
+			case BLACK_WINS:
+				printf("Result: Black wins\n");
+				sig_exit(0);
+				break;
+			case DRAW:
+				printf("Result: Draw\n");
+				sig_exit(0);
+				break;
+			default:
+				printf("Error occurred in function game_over\n");
+				break;
+		}
+	}
+}
+
 int main(int argc, char **argv) {
 	parse_options(argc, argv);
 	signal(SIGINT, sig_exit);
 	hash_table = calloc(hash_table_size, sizeof(Evaluated_Position));
 	mutex_table = calloc(hash_table_size, sizeof(pthread_mutex_t));
 	for (int i = 0; i < hash_table_size; i++) pthread_mutex_init(mutex_table + i, NULL);
-	setlocale(LC_ALL, "");
+	setlocale(LC_ALL, ""); // Should allow for the display of UTF-8 characters (in particular, chess pieces)
 	Position position;
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
 	Position new_p;
+	int flag = 0;
+	printf("Ready\n");
+	fflush(stdout);
 	while (1) {
-		if (verbose) {
-			print_position(&position);
-			printf("Move: \n");
-			fflush(stdout);
-		}
-		Move move = get_user_move();
+		if (verbose) print_position(&position);
+		Move move = get_user_move(&position);
 		make_move(&position, &new_p, &move);
 		position = new_p;
-		time_t t1, t2;
 		if (verbose) print_position(&position);
-		time(&t1);
+		else if (position.in_check) {
+			printf("Check %d\n", 1 - position.turn);
+			fflush(stdout);
+		}
+		check_if_game_over(&position);
 		Move cmp_response = evaluate_all(&position, start_depth);
 		make_move(&position, &new_p, &cmp_response);
-		if (!verbose) {
-			printf("%c%c%c%c", '0' + cmp_response.start.row, '0' + cmp_response.start.col, '0' + cmp_response.end.row, '0' + cmp_response.end.col);
-			fflush(stdout);
-		}
-		//position = new_p;
-		time(&t2);
-		if (verbose) {
-			printf("Time: %f. Hash hits: %d/%d.  Evaluated positions: %d\n.", difftime(t2, t1), hash_hit, hash_check, positions_evaluated);
-			fflush(stdout);
-		}
-		sr = 0;
-		sc = 0;
-		hash_hit = 0;
-		hash_check = 0;
-		memset(hash_table, 0, sizeof(Evaluated_Position) * hash_table_size);
 		position = new_p;
+		if (!verbose) {
+			printf("Response %c%c%c%c\n", '0' + cmp_response.start.row, '0' + cmp_response.start.col, '0' + cmp_response.end.row, '0' + cmp_response.end.col);
+			if (position.in_check) printf("Check %d\n", 1 - position.turn);
+			fflush(stdout);
+		}
+		check_if_game_over(&position);
+		memset(hash_table, 0, sizeof(Evaluated_Position) * hash_table_size);
 	}
 	return 0;
 }
