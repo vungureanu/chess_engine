@@ -5,8 +5,9 @@
 	<title>Chess Variants</title>
 </head>
 <body>
+	<p id="result_text" style="position: relative; text-align: center; margin-bottom: 25px"></p>
 	<div id="board_container"></div>
-	<table id="game_info">
+	<table id="game_info" style="position: relative; margin-top: 25px">
 		<colgroup>
 			<col span="1" style="width: 15%">
 			<col span="1" style="width: 35%">
@@ -15,8 +16,8 @@
 		</colgroup>
 		<tr>
 			<td id="white_checks" align="left">White:</td>
-			<td align="center"><button id="new_three_checks">Start new game<br>(three checks)</button></td>
-			<td align="center"><button id="new_kings_cross">Start new game<br>(king's cross)</button></td>
+			<td align="center"><button id="new_three_checks" style="border-radius: 10px;">Start new game<br>(three checks)</button></td>
+			<td align="center"><button id="new_kings_cross" style="border-radius: 10px;">Start new game<br>(king's cross)</button></td>
 			<td id="black_checks" align="right">Black:</td>
 		</tr>
 	</table>

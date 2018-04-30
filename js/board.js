@@ -17,21 +17,23 @@ var white_checks = document.getElementById("white_checks");
 var black_checks = document.getElementById("black_checks");
 var new_three_checks = document.getElementById("new_three_checks");
 var new_kings_cross = document.getElementById("new_kings_cross");
+var result_text = document.getElementById("result_text");
+result_text.innerHTML = "Click on one of the buttons below to start a new game."
 white_checks.checks = 0;
 black_checks.checks = 0;
-new_three_checks.addEventListener("click", function() {
-	socket.emit("new_game", "three_checks");
+new_three_checks.addEventListener("click", start_game.bind(null, "three_checks"));
+new_kings_cross.addEventListener("click", start_game.bind(null, "kings_cross"));
+
+function start_game(game_type) {
+	socket.emit("new_game", game_type);
 	reset_pieces();
-});
-new_kings_cross.addEventListener("click", function() {
-	socket.emit("new_game", "kings_cross");
-	reset_pieces();
-});
+	result_text.innerHTML = "White to move";
+	pending_move = null;
+}
 
 function set_board_length(length) {
 	board_length = length - (length % N);
 	square_length = length / N;
-	console.log(board_length);
 }
 set_board_length(500);
 
@@ -43,13 +45,13 @@ addEventListener("pieces loaded", function() {
 });
 
 socket.on("response", function(response_str) {
+	result_text.innerHTML = "White to move"
 	var response = JSON.parse(response_str);
-	console.log(response);
 	move(response.start, response.end);
 });
 
 socket.on("legal", function() {
-	console.log("Legal");
+	result_text.innerHTML = "Thinking...";
 	clear_highlight(pending_move.start);
 	clear_highlight(pending_move.end);
 	move(pending_move.start, pending_move.end);
@@ -57,21 +59,20 @@ socket.on("legal", function() {
 });
 
 socket.on("illegal", function() {
+	result_text.innerHTML = "Illegal move; White to move";
 	clear_highlight(pending_move.start);
 	clear_highlight(pending_move.end);
 	pending_move = null;
-	console.log("Illegal");
 });
 
 socket.on("result", function(result) {
+	result_text.innerHTML = result.trim();
 	for (var square of highlighted_squares) {
 		clear_highlight(square);
 	}
-	console.log(result);
 });
 
 socket.on("check", function(side) {
-	console.log("OK");
 	if (side == 0) {
 		white_checks.checks++;
 		white_checks.innerHTML = "White: " + white_checks.checks;
@@ -86,29 +87,27 @@ var pending_move;
 
 function set_element(container_id, size, n) {
 	var container = document.getElementById(container_id);
-	container.style.position = "absolute";
+	container.style.position = "relative";
 	container.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
-	container.style.top = Math.floor(window.innerHeight / 2 - board_length / 2) + "px";
+	container.style.height = board_length + "px";
+	container.style.width = board_length + "px";
+	result_text.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
+	result_text.style.width = board_length + "px";
 	board_canvas = document.createElement("canvas");
 	board_canvas.style.position = "absolute";
-	board_canvas.style.left = "0px";
-	board_canvas.style.top = "0px";
 	board_canvas.width = size;
 	board_canvas.height = size;
-	//board_canvas.style.border = "5px solid";
 	board_context = board_canvas.getContext("2d");
 	container.appendChild(board_canvas);
 	pieces_canvas = document.createElement("canvas");
 	pieces_canvas.style.position = "absolute";
-	pieces_canvas.style.left = "0px";
-	pieces_canvas.style.top = "0px";
 	pieces_context = pieces_canvas.getContext("2d");
 	container.appendChild(board_canvas);
 	container.appendChild(pieces_canvas);
 	pieces_canvas.width = size;
 	pieces_canvas.height = size;
 	pieces_context.strokeStyle = "yellow";
-	pieces_context.lineWidth = 2 * offset;
+	pieces_context.lineWidth = 2 * offset - 1;
 	pieces_canvas.onmousedown = function(e) {
 		var col = Math.floor((e.pageX - container.offsetLeft) / square_length);
 		var row = Math.floor((e.pageY - container.offsetTop) / square_length);
@@ -126,7 +125,6 @@ function set_element(container_id, size, n) {
 			pieces_context.strokeRect(col * square_length + offset, row * square_length + offset, square_length - 2 * offset, square_length - 2 * offset);
 			pending_move = {start: Object.assign({}, highlighted_squares[0]), end: Object.assign({}, highlighted_squares[1])};
 			socket.emit("move", JSON.stringify(pending_move));
-			console.log("Pending:", pending_move);
 			highlighted_squares = [null, null];
 		}
 	}
@@ -164,14 +162,14 @@ function reset_pieces() {
 	}
 	add_piece("black_king", 0, N-1);
 	add_piece("white_king", N-1, 0);
+	white_checks = 0;
+	black_checks = 0;
 }
 
 function initialize_table() {
-	table.style.position = "absolute";
 	table.style.width = board_length + "px";
 	table.style.overflow = "scroll";
 	table.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
-	table.style.top = Math.floor(window.innerHeight / 2 + board_length / 2) + table_padding + "px";
 }
 
 function add_piece(piece_name, row, col) {

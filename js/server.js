@@ -12,18 +12,14 @@ process.on('exit', function() {
 	engines.forEach(function(value, key, map) {
 		value.kill("SIGINT");
 	});
+	console.log("Goodbye");
 });
 
-process.on('SIGINT', function() {
-	engines.forEach(function(value, key, map) {
-		value.kill("SIGINT");
-	});
-	console.log("Goodbye");
-	process.exit();
-});
+process.on('SIGINT', process.exit);
 
 function parse_engine_data(engine, socket, data_str) {
-	console.log(data_str);
+	if (data_str == "") return;
+	console.log("Sent to client:", data_str);
 	if (data_str.substring(0, 5) == "Legal") {
 		socket.emit("legal");
 	}
@@ -46,38 +42,37 @@ function parse_engine_data(engine, socket, data_str) {
 }
 
 io.on('connection', function(socket){
+	var engine;
 	var engine_num = tot_engines;
 	tot_engines++;
-	var engine = cp.spawn("./a.out");
-	engines.set(engine_num, engine);
-	engine.stdout.on("data", function(data_buf) {
-		data = data_buf.toString("utf8").split("\n");
-		data.forEach( (data_str) => parse_engine_data(engine, socket, data_str) );
-	});
 	socket.on("move", function(move_str) {
+		console.log("Received move:", move_str);
 		var move = JSON.parse(move_str);
 		try {
-			engine.stdin.write(move.start.row.toString() + move.start.col.toString() + move.end.row.toString() + move.end.col.toString() + "\n");		
+			if (engine != null) engine.stdin.write(move.start.row.toString() + move.start.col.toString() + move.end.row.toString() + move.end.col.toString() + "\n");		
 		}
 		catch(error) {
 			console.log(error);
-			engine.kill("SIGINT");
+			if (engine != null) engine.kill("SIGINT");
 		}
 	});
 	socket.on("disconnect", function() {
-		engine.kill("SIGINT");
+		if (engine != null) engine.kill("SIGINT");
 		engines.delete(engine_num);
 	});
 	socket.on("new_game", function(game_type) {
-		engine.kill("SIGINT");
-		console.log("OK1");
+		if (engine != null) engine.kill("SIGINT");
 		if (game_type == "three_checks") {
 			engine = cp.spawn("./a.out");
 		}
 		else {
-			engine = cp.spawn("./a.out", ["-m "])
+			engine = cp.spawn("./a.out", ["-m "]);
 		}
-		console.log(engine);
+		engines.set(engine_num, engine);
+		engine.stdout.on("data", function(data_buf) {
+			data = data_buf.toString("utf8").split("\n");
+			data.forEach( (data_str) => parse_engine_data(engine, socket, data_str) );
+		});
 	});
 });
 
