@@ -32,6 +32,7 @@
 #define FORCED_WIN_WHITE 101
 #define BLACK_WINS -120
 #define WHITE_WINS 120
+#define MAX_MOVES 100
 
 typedef struct Coord {
 	int8_t row;
@@ -103,7 +104,7 @@ void *get_best_move_wrapper(void *position_depth_and_ptr);
 // reduce search space, and so may produce sub-optimal moves.  Its wrapper serves as a suitable entry point
 // for newly created threads.
 
-int equal_cmp(Compressed_Position *p1, Compressed_Position *p2); // Determines whether the two positions are equal
+int equal_cmp(Compressed_Position *p1, Compressed_Position *p2); // Determines whether two positions are equal
 int equal_crd(Coord *c1, Coord *c2); // Determines whether two coordinates are equal
 void add_to_hash(Compressed_Position *compressed_position, int evaluation, int depth, int index);
 int check_hash(Compressed_Position *compressed_position, int depth, int *index);
@@ -139,22 +140,23 @@ Compressed_Position compress_position(Position *pp);
 // Allow for the compression (for use in hash table) and decompression (for all other uses) of "Position" structures
 
 int game_over(Position *pp, int available_moves, int *flag);
-void check_if_game_over(Position *pp);
-// Determine whether the game has finished in a win for either side, or in a draw
+void check_if_game_over(Position *pp, int move_number, Compressed_Position *position_history);
+// If the game has finished, exit and print the result
+
+void standard_exit(int sig_num); // Close semaphore, free allocated memory, and exit
+
+void update_status(int *move_number, Compressed_Position *position_history, Position *new_pp, Position *pp);
+// Do some book-keeping to update game score (i.e., "position_history") and position
 
 int positions_evaluated = 0;
 Evaluated_Position *hash_table;
 pthread_mutex_t *mutex_table;
-int hash_table_size = 99991;
-int hash_check = 0;
-int hash_hit = 0;
+int hash_table_size = 1000000;
 int number_of_threads = 8;
 int start_depth = 9;
 Mode mode = THREE_CHECKS;
 int verbose = 0;
 sem_t *thread_num;
-pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t hash_cond = PTHREAD_COND_INITIALIZER;
 
 Compressed_Position compress_position(Position *pp) { // Associates each position with a unique 64-bit integer
 	uint32_t cmp_white = 0, cmp_black = 0, square = 0;
@@ -220,7 +222,6 @@ int equal_cmp(Compressed_Position *p1, Compressed_Position *p2) {
 }
 
 int check_hash(Compressed_Position *compressed_position, int depth, int *index) {
-	hash_check++;
 	int p_hash = hash(compressed_position);
 	int worst_index = p_hash;
 	int worst_depth = MAX_DEPTH + 1;
@@ -234,7 +235,6 @@ int check_hash(Compressed_Position *compressed_position, int depth, int *index) 
 				worst_index = index;
 			}
 			if (equal_cmp(&hash_table[index].compressed_position, compressed_position) && hash_table[index].depth >= depth) {
-				hash_hit++;
 				evaluation = hash_table[index].evaluation;
 				for (int j = 0; j <= i; j++) pthread_mutex_unlock(mutex_table + (p_hash + j) % hash_table_size);
 				return evaluation;
@@ -508,14 +508,16 @@ int game_over(Position *pp, int available_moves, int *flag) {
 		return 0;
 	}
 	if (mode == KINGS_CROSS) {
-		if (pp->kings[WHITE].row == 0) return WHITE_WINS;
-		if (pp->kings[BLACK].row == N-1) return BLACK_WINS;
+		if (pp->kings[WHITE].row == 0) {
+			*flag = WHITE_WINS;
+			return 1;
+		}
+		if (pp->kings[BLACK].row == N-1) {
+			*flag = BLACK_WINS;
+			return 1;
+		}
 		if (available_moves == 0) {
-			if (pp->in_check) {
-				if (pp->turn == WHITE) *flag = BLACK_WINS;
-				else *flag = WHITE_WINS;
-			}
-			else *flag = DRAW;
+			*flag = (pp->in_check) ? ((pp->turn == WHITE) ? BLACK_WINS : WHITE_WINS) : DRAW;
 			return 1;
 		}
 		return 0;
@@ -527,7 +529,9 @@ int evaluate_position(Position *pp) {
 	if (mode == THREE_CHECKS) {
 		return (2 * pp->number_of_knights[0] + pp->checks[0]) - (2 * pp->number_of_knights[1] + pp->checks[1]);
 	}
-	if (mode == KINGS_CROSS) return (2 * pp->number_of_knights[WHITE] + (N - pp->kings[WHITE].row)) - (2 * pp->number_of_knights[BLACK] + pp->kings[BLACK].row + 1);
+	if (mode == KINGS_CROSS) {
+		return (2 * pp->number_of_knights[WHITE] + (N - pp->kings[WHITE].row)) - (2 * pp->number_of_knights[BLACK] + pp->kings[BLACK].row + 1);
+	}
 	return 0;
 }
 
@@ -563,8 +567,16 @@ Move evaluate_all(Position *pp, int depth) {
 	}
 	sem_close(thread_num);
 	sem_unlink("/semaphore");
-	int index = pp->turn == WHITE ? find_max_index(em_array, n) : find_min_index(em_array, n);
-	return em_array[index].move;
+	int best_index = pp->turn == WHITE ? find_max_index(em_array, n) : find_min_index(em_array, n);
+	int count = 0;
+	int viable_indices[n];
+	for (int i = 0; i < n; i++) {
+		if (em_array[i].evaluation == em_array[best_index].evaluation) {
+			viable_indices[count] = i;
+			count++;
+		}
+	}
+	return em_array[viable_indices[arc4random() % count]].move;
 }
 
 void print_em(Evaluated_Move em) {
@@ -766,7 +778,7 @@ int check_prime(int p, int *prime_array, int n) {
 	return 1;
 }
 
-void sig_exit(int sig_num) {
+void standard_exit(int sig_num) {
 	sem_close(thread_num);
 	free(hash_table);
 	free(mutex_table);
@@ -777,7 +789,7 @@ void sig_exit(int sig_num) {
 int parse_options(int argc, char **argv) {
 	int option;
 	long arg;
-	while ((option = getopt(argc, argv, "h:t:d:m:v")) != -1) {
+	while ((option = getopt(argc, argv, "h:t:d:mv")) != -1) {
 		switch (option) {
 			case 'h':
 				arg = strtol(optarg, NULL, 10);
@@ -808,64 +820,82 @@ int parse_options(int argc, char **argv) {
 	return 0;
 }
 
-void check_if_game_over(Position *pp) {
+void check_if_game_over(Position *pp, int move_number, Compressed_Position *position_history) {
 	int flag;
 	Evaluated_Move em_array[(K+1) * 8];
 	if (game_over(pp, get_moves(pp, em_array), &flag)) {
 		switch (flag) {
 			case WHITE_WINS:
 				printf("Result: White wins\n");
-				sig_exit(0);
+				standard_exit(0);
 				break;
 			case BLACK_WINS:
 				printf("Result: Black wins\n");
-				sig_exit(0);
+				standard_exit(0);
 				break;
 			case DRAW:
 				printf("Result: Draw\n");
-				sig_exit(0);
+				standard_exit(0);
 				break;
 			default:
 				printf("Error occurred in function game_over\n");
 				break;
 		}
 	}
+	int count = 0;
+	for (int i = 0; i < move_number - 1; i++) {
+		count += equal_cmp(position_history + i, position_history + (move_number-1));
+		if (count == 2) { // Position has occurred two times before
+			printf("Result: Draw\n");
+			standard_exit(0);
+		}
+	}
+}
+
+void update_status(int *move_number, Compressed_Position *position_history, Position *new_pp, Position *pp) {
+	position_history[*move_number] = compress_position(new_pp);
+	(*move_number)++;
+	*pp = *new_pp;
 }
 
 int main(int argc, char **argv) {
 	parse_options(argc, argv);
-	signal(SIGINT, sig_exit);
+	signal(SIGINT, standard_exit);
 	hash_table = calloc(hash_table_size, sizeof(Evaluated_Position));
 	mutex_table = calloc(hash_table_size, sizeof(pthread_mutex_t));
 	for (int i = 0; i < hash_table_size; i++) pthread_mutex_init(mutex_table + i, NULL);
 	setlocale(LC_ALL, ""); // Should allow for the display of UTF-8 characters (in particular, chess pieces)
 	Position position;
+	Position new_position;
+	Move cmp_response; // Computer's response
 	memset(&position, 0, sizeof(position));
 	get_starting_position(&position);
-	Position new_p;
 	int flag = 0;
+	Compressed_Position position_history[MAX_MOVES];
+	position_history[0] = compress_position(&position);
+	int move_number = 1; // Move number of the next move to be played
 	printf("Ready\n");
 	fflush(stdout);
 	while (1) {
 		if (verbose) print_position(&position);
 		Move move = get_user_move(&position);
-		make_move(&position, &new_p, &move);
-		position = new_p;
+		make_move(&position, &new_position, &move);
+		update_status(&move_number, position_history, &new_position, &position);
 		if (verbose) print_position(&position);
 		else if (position.in_check) {
 			printf("Check %d\n", 1 - position.turn);
 			fflush(stdout);
 		}
-		check_if_game_over(&position);
-		Move cmp_response = evaluate_all(&position, start_depth);
-		make_move(&position, &new_p, &cmp_response);
-		position = new_p;
+		check_if_game_over(&position, move_number, position_history);
+		cmp_response = evaluate_all(&position, start_depth);
+		make_move(&position, &new_position, &cmp_response);
+		update_status(&move_number, position_history, &new_position, &position);
 		if (!verbose) {
 			printf("Response %c%c%c%c\n", '0' + cmp_response.start.row, '0' + cmp_response.start.col, '0' + cmp_response.end.row, '0' + cmp_response.end.col);
 			if (position.in_check) printf("Check %d\n", 1 - position.turn);
 			fflush(stdout);
 		}
-		check_if_game_over(&position);
+		check_if_game_over(&position, move_number, position_history);
 		memset(hash_table, 0, sizeof(Evaluated_Position) * hash_table_size);
 	}
 	return 0;

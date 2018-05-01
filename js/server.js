@@ -35,8 +35,10 @@ function parse_engine_data(engine, socket, data_str) {
 	else if (data_str.substring(0, 6) == "Result") {
 		socket.emit("result", data_str.split(":")[1].trim());
 		engine.kill("SIGINT");
+		engine = null;
 	}
 	else if (data_str.substring(0, 5) == "Check") {
+		console.log("Check!");
 		socket.emit("check", data_str.split(" ")[1]);
 	}
 }
@@ -52,8 +54,8 @@ io.on('connection', function(socket){
 			if (engine != null) engine.stdin.write(move.start.row.toString() + move.start.col.toString() + move.end.row.toString() + move.end.col.toString() + "\n");		
 		}
 		catch(error) {
+			console.log("Error occurred.");
 			console.log(error);
-			if (engine != null) engine.kill("SIGINT");
 		}
 	});
 	socket.on("disconnect", function() {

@@ -9,7 +9,8 @@ var square_length;
 var board = [];
 var socket = io();
 const table_padding = 15;
-const offset = 1.5;
+const offset = 10;
+const highlight_offset = 2;
 var highlighted_squares = [null, null];
 var pieces_loaded_event = new Event("pieces loaded");
 var table = document.getElementById("game_info");
@@ -19,8 +20,6 @@ var new_three_checks = document.getElementById("new_three_checks");
 var new_kings_cross = document.getElementById("new_kings_cross");
 var result_text = document.getElementById("result_text");
 result_text.innerHTML = "Click on one of the buttons below to start a new game."
-white_checks.checks = 0;
-black_checks.checks = 0;
 new_three_checks.addEventListener("click", start_game.bind(null, "three_checks"));
 new_kings_cross.addEventListener("click", start_game.bind(null, "kings_cross"));
 
@@ -29,6 +28,10 @@ function start_game(game_type) {
 	reset_pieces();
 	result_text.innerHTML = "White to move";
 	pending_move = null;
+	white_checks.innerHTML = "White: 0";
+	black_checks.innerHTML = "Black: 0";
+	white_checks.style.visibility = (game_type == "three_checks") ? "visible" : "hidden";
+	black_checks.style.visibility = (game_type == "three_checks") ? "visible" : "hidden";
 }
 
 function set_board_length(length) {
@@ -73,7 +76,7 @@ socket.on("result", function(result) {
 });
 
 socket.on("check", function(side) {
-	if (side == 0) {
+	if (side == "0") {
 		white_checks.checks++;
 		white_checks.innerHTML = "White: " + white_checks.checks;
 	}
@@ -89,32 +92,46 @@ function set_element(container_id, size, n) {
 	var container = document.getElementById(container_id);
 	container.style.position = "relative";
 	container.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
-	container.style.height = board_length + "px";
-	container.style.width = board_length + "px";
-	result_text.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
+	container.style.height = size + 2 * offset + "px";
+	container.style.width = size + 2 * offset + "px";
+	result_text.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + offset + "px";
 	result_text.style.width = board_length + "px";
 	board_canvas = document.createElement("canvas");
-	board_canvas.style.position = "absolute";
-	board_canvas.width = size;
-	board_canvas.height = size;
-	board_context = board_canvas.getContext("2d");
-	container.appendChild(board_canvas);
+	var border_canvas = document.createElement("canvas");
 	pieces_canvas = document.createElement("canvas");
-	pieces_canvas.style.position = "absolute";
+	for (canvas of [board_canvas, border_canvas, pieces_canvas]) {
+		canvas.style.position = "absolute";
+		canvas.width = size + 2 * offset;
+		canvas.height = size + 2 * offset;
+		container.appendChild(canvas);
+	}
+	border_canvas.zIndex = "3";
+	pieces_canvas.zIndex = "1";
+	board_canvas.zIndex = "2";
+	board_context = board_canvas.getContext("2d");
+	var border_context = border_canvas.getContext("2d");
+	border_context.strokeStyle = "black";
+	border_context.lineWidth = 1;
+	for (var i = 0; i <= N; i++) {
+		border_context.beginPath();
+		border_context.moveTo(offset + i * square_length, offset);
+		border_context.lineTo(offset + i * square_length, size + offset + 2); // For some mysterious reason, it is necessary to add 2 for the line to reach the end of the board
+		border_context.stroke();
+		border_context.beginPath();
+		border_context.moveTo(offset, offset + i * square_length);
+		border_context.lineTo(size + offset + 2, offset + i * square_length);
+		border_context.stroke();
+	}
 	pieces_context = pieces_canvas.getContext("2d");
-	container.appendChild(board_canvas);
-	container.appendChild(pieces_canvas);
-	pieces_canvas.width = size;
-	pieces_canvas.height = size;
 	pieces_context.strokeStyle = "yellow";
-	pieces_context.lineWidth = 2 * offset - 1;
+	pieces_context.lineWidth = 2;
 	pieces_canvas.onmousedown = function(e) {
-		var col = Math.floor((e.pageX - container.offsetLeft) / square_length);
-		var row = Math.floor((e.pageY - container.offsetTop) / square_length);
-		if (pending_move != null) return;
+		var col = Math.floor((e.pageX - container.offsetLeft - offset - container.parentElement.offsetLeft) / square_length);
+		var row = Math.floor((e.pageY - container.offsetTop - offset - container.parentElement.offsetTop) / square_length);
+		if (pending_move != null || col < 0 || col >= N || row < 0 || row >= N) return;
 		if (highlighted_squares[0] == null) {
 			highlighted_squares[0] = { row: row, col: col };
-			pieces_context.strokeRect(col * square_length + offset, row * square_length + offset, square_length - 2 * offset, square_length - 2 * offset);
+			pieces_context.strokeRect(offset + highlight_offset + col * square_length, offset + highlight_offset + row * square_length, square_length - 2 * highlight_offset, square_length - 2 * highlight_offset);
 		}
 		else if (highlighted_squares[0].row == row && highlighted_squares[0].col == col) {
 			clear_highlight(highlighted_squares[0]);
@@ -122,7 +139,7 @@ function set_element(container_id, size, n) {
 		}
 		else if (highlighted_squares[1] == null) {
 			highlighted_squares[1] = { row: row, col: col };
-			pieces_context.strokeRect(col * square_length + offset, row * square_length + offset, square_length - 2 * offset, square_length - 2 * offset);
+			pieces_context.strokeRect(offset + highlight_offset + col * square_length, offset + highlight_offset + row * square_length, square_length - 2 * highlight_offset, square_length - 2 * highlight_offset);
 			pending_move = {start: Object.assign({}, highlighted_squares[0]), end: Object.assign({}, highlighted_squares[1])};
 			socket.emit("move", JSON.stringify(pending_move));
 			highlighted_squares = [null, null];
@@ -132,7 +149,7 @@ function set_element(container_id, size, n) {
 
 function clear_highlight(square) {
 	if (square == null) return;
-	pieces_context.clearRect(square.col * square_length, square.row * square_length, square_length, square_length);
+	pieces_context.clearRect(offset + square.col * square_length, offset + square.row * square_length, square_length, square_length);
 	if (board[square.row][square.col] != "empty") {
 		add_piece(board[square.row][square.col], square.row, square.col);
 	}
@@ -144,7 +161,7 @@ function initialize_board(n) {
 		for (var j = 0; j < n; j++) {
 			board[board.length-1].push("empty");
 			board_context.fillStyle = ((i + j) % 2 == 0) ? 'rgb(216, 163, 119)' : 'rgb(158, 108, 67)';
-			board_context.fillRect(i * square_length, j * square_length, square_length, square_length);
+			board_context.fillRect(offset + i * square_length, offset + j * square_length, square_length, square_length);
 		}
 	}
 }
@@ -162,26 +179,28 @@ function reset_pieces() {
 	}
 	add_piece("black_king", 0, N-1);
 	add_piece("white_king", N-1, 0);
-	white_checks = 0;
-	black_checks = 0;
+	white_checks.checks = 0;
+	black_checks.checks = 0;
+	white_checks.innerHTML = "";
+	black_checks.innerHTML = "";
 }
 
 function initialize_table() {
 	table.style.width = board_length + "px";
 	table.style.overflow = "scroll";
-	table.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + "px";
+	table.style.left = Math.floor(window.innerWidth / 2 - board_length / 2) + offset + "px";
 }
 
 function add_piece(piece_name, row, col) {
 	board[row][col] = piece_name;
-	pieces_context.drawImage(pieces.get(piece_name), col * square_length, row * square_length, square_length, square_length);
+	pieces_context.drawImage(pieces.get(piece_name), offset + col * square_length, offset + row * square_length, square_length, square_length);
 }
 
 function move(start, end) {
-	pieces_context.clearRect(start.col * square_length, start.row * square_length, square_length, square_length);
-	pieces_context.clearRect(end.col * square_length, end.row * square_length, square_length, square_length);
+	pieces_context.clearRect(offset + start.col * square_length, offset + start.row * square_length, square_length, square_length);
+	pieces_context.clearRect(offset + end.col * square_length, offset + end.row * square_length, square_length, square_length);
 	board[end.row][end.col] = board[start.row][start.col];
-	pieces_context.drawImage(pieces.get(board[start.row][start.col]), end.col * square_length, end.row * square_length, square_length, square_length);
+	pieces_context.drawImage(pieces.get(board[start.row][start.col]), offset + end.col * square_length, offset + end.row * square_length, square_length, square_length);
 	board[start.row][start.col] = "empty";
 }
 
