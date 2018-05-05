@@ -43,8 +43,8 @@ function parse_engine_data(engine, socket, data_str) {
 	}
 }
 
-io.on('connection', function(socket){
-	var engine;
+io.on('connection', function(socket) {
+	var engine = null;
 	var engine_num = tot_engines;
 	tot_engines++;
 	socket.on("move", function(move_str) {
@@ -64,6 +64,10 @@ io.on('connection', function(socket){
 	});
 	socket.on("new_game", function(game_type) {
 		if (engine != null) engine.kill("SIGINT");
+		if (engines.size > 10) {
+			socket.emit("status", "Server busy; please try again later.");
+			return;
+		}
 		if (game_type == "three_checks") {
 			engine = cp.spawn("./a.out");
 		}
@@ -78,6 +82,6 @@ io.on('connection', function(socket){
 	});
 });
 
-http.listen(3000, function(){
+http.listen(3000, function() {
 	console.log('listening on *:3000');
 });
