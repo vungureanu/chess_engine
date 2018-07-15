@@ -648,7 +648,7 @@ int find_best_move(Position *pp, Move *mp, int alpha, int beta, int depth) { // 
 }
 
 int shallow_reject(Position *pp, int alpha, int beta, int *flag, int *shallow_best) {
-	// We reject the position from the perspective of the side which has just moved (i.e., not from the perspective of pp->turn)
+	// We reject the position from the perspective of the side which has just moved (i.e., the side indicated by 1 - pp->turn)
 	Move best_move;
 	int evaluation = find_best_move(pp, &best_move, ALPHA_REJECT, BETA_REJECT, SHALLOW_SEARCH_DEPTH);
 	if (pp->turn == BLACK) {
@@ -823,6 +823,10 @@ int parse_options(int argc, char **argv) {
 void check_if_game_over(Position *pp, int move_number, Compressed_Position *position_history) {
 	int flag;
 	Evaluated_Move em_array[(K+1) * 8];
+	if (move_number == MAX_MOVES) {
+		printf("Result: Draw\n");
+		standard_exit(0);
+	}
 	if (game_over(pp, get_moves(pp, em_array), &flag)) {
 		switch (flag) {
 			case WHITE_WINS:
