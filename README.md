@@ -8,7 +8,7 @@ gcc chess_engine/search.c
 ./chess_engine/a.out -v
 ```
 
-You should be presented with a graphical representation of a chess board (assuming your systems supports the appropriate Unicode characters).  A square is specified by a letter and a number (e.g., b3); a piece can be moved by concatenating its starting square with its ending square (e.g., entering f1e3 moves the knight in the bottom-right corner up two squares and to the left one square).  After making your move, the system will print the engine's evaluation of its possible moves and make the move it considers to be best.  It will then print the resulting board position, together with some debugging information.
+You should be presented with a graphical representation of a chess board (assuming your systems supports the appropriate Unicode characters).  A square is specified by a letter and a number (e.g., b3); a piece can be moved by concatenating its starting square with its ending square (e.g., entering f1e3 moves the knight in the bottom-right corner up two squares and to the left one square).  After making your move, the engine will respond as it considers best and print its evaluation of all possible responses.  It will then print the resulting board position, together with some debugging information.
 
 ## Documentation ##
 
